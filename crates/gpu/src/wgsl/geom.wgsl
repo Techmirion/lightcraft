@@ -28,6 +28,36 @@ fn bilinear(w: u32, h: u32, x: f32, y: f32) -> vec3<f32> {
     return top + (bot - top) * ty;
 }
 
+fn catmull_rom(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2));
+}
+
+fn cubic_row(w: u32, h: u32, ix: i32, y: i32, wx: vec4<f32>) -> vec3<f32> {
+    return src_px(w, h, ix - 1, y) * wx.x + src_px(w, h, ix, y) * wx.y + src_px(w, h, ix + 1, y) * wx.z + src_px(w, h, ix + 2, y) * wx.w;
+}
+
+// `Rgb32f::sample_cubic`: Catmull-Rom, clamped to the range of the four nearest pixels.
+fn cubic(w: u32, h: u32, x: f32, y: f32) -> vec3<f32> {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let wx = catmull_rom(fx - x0);
+    let wy = catmull_rom(fy - y0);
+    let ix = i32(x0);
+    let iy = i32(y0);
+    // (no dynamic indexing of vectors: FXC on DX12 is picky about it)
+    let acc = cubic_row(w, h, ix, iy - 1, wx) * wy.x + cubic_row(w, h, ix, iy, wx) * wy.y + cubic_row(w, h, ix, iy + 1, wx) * wy.z
+        + cubic_row(w, h, ix, iy + 2, wx) * wy.w;
+    let a = src_px(w, h, ix, iy);
+    let b = src_px(w, h, ix + 1, iy);
+    let c = src_px(w, h, ix, iy + 1);
+    let d = src_px(w, h, ix + 1, iy + 1);
+    return clamp(acc, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+}
+
 fn put(i: u32, v: vec3<f32>) {
     dst[3u * i] = v.x;
     dst[3u * i + 1u] = v.y;
@@ -53,7 +83,7 @@ fn orient(@builtin(global_invocation_id) g: vec3<u32>) {
     put(g.y * ow + g.x, vec3<f32>(src[j], src[j + 1u], src[j + 2u]));
 }
 
-// Bilinear resample through an affine (output px → base px). P: bw, bh, w, h, affine[6].
+// Bicubic resample through an affine (output px → base px). P: bw, bh, w, h, affine[6].
 @compute @workgroup_size(16, 16)
 fn sample_affine(@builtin(global_invocation_id) g: vec3<u32>) {
     let w = pu(2u);
@@ -65,7 +95,7 @@ fn sample_affine(@builtin(global_invocation_id) g: vec3<u32>) {
     let py = f32(g.y) + 0.5;
     let x = pf(4u) * px + pf(6u) * py + pf(8u);
     let y = pf(5u) * px + pf(7u) * py + pf(9u);
-    put(g.y * w + g.x, bilinear(pu(0u), pu(1u), x, y));
+    put(g.y * w + g.x, cubic(pu(0u), pu(1u), x, y));
 }
 
 // --- the lens / perspective warp (`lightcraft_pipeline::optics::Warp`), in oriented-source px.
@@ -183,12 +213,12 @@ fn sample_warp(@builtin(global_invocation_id) g: vec3<u32>) {
         put(g.y * w + g.x, vec3<f32>(BLANK_R, BLANK_G, BLANK_B));
         return;
     }
-    var v = bilinear(bw, bh, s.x * sx, s.y * sy);
+    var v = cubic(bw, bh, s.x * sx, s.y * sy);
     if (pu(63u) != 0u) {
         let qr = corrected_to_source(c, 0u);
-        v.x = bilinear(bw, bh, qr.x * sx, qr.y * sy).x;
+        v.x = cubic(bw, bh, qr.x * sx, qr.y * sy).x;
         let qb = corrected_to_source(c, 2u);
-        v.z = bilinear(bw, bh, qb.x * sx, qb.y * sy).z;
+        v.z = cubic(bw, bh, qb.x * sx, qb.y * sy).z;
     }
     if (pu(64u) != 0u) {
         v = v * warp_gain(s);

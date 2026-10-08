@@ -202,7 +202,7 @@ impl Frame {
     }
 
     /// Sample the source into a `w × h` output buffer: orientation, crop, rotation, flips — one
-    /// bilinear resample from a pre-filtered (area-downscaled) copy, so minification never aliases.
+    /// bicubic resample from a pre-filtered (area-downscaled) copy, so minification never aliases.
     pub fn sample(&self, src: &Rgb32f, w: usize, h: usize) -> Rgb32f {
         let oriented = if self.orient == Orientation::Normal { None } else { Some(src.oriented(self.orient)) };
         let o = oriented.as_ref().unwrap_or(src);
@@ -216,7 +216,7 @@ impl Frame {
             par_rows(&mut out.data, w, |y, row| {
                 for (x, px) in row.iter_mut().enumerate() {
                     let p = xf.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
-                    *px = base.sample_bilinear(p.x as f32, p.y as f32);
+                    *px = base.sample_cubic(p.x as f32, p.y as f32);
                 }
             });
             out
@@ -286,11 +286,11 @@ fn sample_warped(base: &Rgb32f, sx: f64, sy: f64, wp: &Warp, o2t: Affine, w: usi
                 *px = BLANK;
                 continue;
             };
-            let mut v = base.sample_bilinear((g.x * sx) as f32, (g.y * sy) as f32);
+            let mut v = base.sample_cubic((g.x * sx) as f32, (g.y * sy) as f32);
             if per_channel {
                 for ch in [0usize, 2] {
                     let q = wp.corrected_to_source(c, ch);
-                    v[ch] = base.sample_bilinear((q.x * sx) as f32, (q.y * sy) as f32)[ch];
+                    v[ch] = base.sample_cubic((q.x * sx) as f32, (q.y * sy) as f32)[ch];
                 }
             }
             if gain {

@@ -222,7 +222,12 @@ fn burst_stacking_modes() {
         p[0] / (p[1] + 1e-4)
     };
     let base = red(&single);
-    eprintln!("red/green at the passer-by: single {base:.2}, median {:.2}, sigma {:.2}, lighten {:.2}", red(&med.radiance), red(&sig.radiance), red(&lig.radiance));
+    eprintln!(
+        "red/green at the passer-by: single {base:.2}, median {:.2}, sigma {:.2}, lighten {:.2}",
+        red(&med.radiance),
+        red(&sig.radiance),
+        red(&lig.radiance)
+    );
     assert!(red(&med.radiance) < 1.5 * base.max(1.0), "median keeps the passer-by");
     assert!(red(&sig.radiance) < 1.5 * base.max(1.0), "sigma-clip keeps the passer-by");
     assert!(red(&lig.radiance) > 1.8 * base.max(1.0), "lighten loses the passer-by");

@@ -317,8 +317,17 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
             });
         }
         stages.push((if on_gpu { "colour (gpu)" } else { "colour" }, t0.elapsed()));
-        // no copy when the image already fits (full-size loads)
-        let img = if img.width.max(img.height) > max_edge { fit(&img, max_edge, max_edge, Filter::Box) } else { img };
+        // no copy when the image already fits (full-size loads). A binned image a little larger than
+        // the level (24 MP binned 2 × 2 = 3000 px for the 2560 px preview level) is kept as it is:
+        // the render resamples once, straight to the size on screen, instead of twice (each
+        // resample softens). A larger one is fitted with a sharp filter (Box blurs and aliases at
+        // non-integer ratios).
+        let long = img.width.max(img.height);
+        let img = if long > max_edge && long.saturating_mul(4) > max_edge.saturating_mul(5) {
+            fit(&img, max_edge, max_edge, Filter::Mitchell)
+        } else {
+            img
+        };
         stages.push(("fit", t0.elapsed()));
         let img = img.into_oriented(raw.orientation);
         stages.push(("orient", t0.elapsed()));

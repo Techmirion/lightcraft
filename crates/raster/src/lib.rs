@@ -203,6 +203,41 @@ impl<T: Copy + Default> Image<T> {
 }
 
 impl Rgb32f {
+    /// Bicubic (Catmull-Rom) sample at continuous pixel coordinates (pixel centres at +0.5,
+    /// clamped edges), deringed: each channel is clamped to the range of the four nearest pixels,
+    /// so edges stay crisp without overshoot. The geometry pass resamples through it (crop, rotate,
+    /// lens and perspective warps); bilinear would soften every warped render by about a third.
+    #[inline]
+    pub fn sample_cubic(&self, x: f32, y: f32) -> [f32; 3] {
+        let fx = x - 0.5;
+        let fy = y - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let wx = catmull_rom(fx - x0);
+        let wy = catmull_rom(fy - y0);
+        let (x0, y0) = (x0 as isize, y0 as isize);
+        let mut acc = [0f32; 3];
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for (j, wyj) in wy.iter().enumerate() {
+            let mut row = [0f32; 3];
+            for (i, wxi) in wx.iter().enumerate() {
+                let v = self.get_clamped(x0 - 1 + i as isize, y0 - 1 + j as isize);
+                for c in 0..3 {
+                    row[c] += wxi * v[c];
+                    if (i == 1 || i == 2) && (j == 1 || j == 2) {
+                        lo[c] = lo[c].min(v[c]);
+                        hi[c] = hi[c].max(v[c]);
+                    }
+                }
+            }
+            for c in 0..3 {
+                acc[c] += wyj * row[c];
+            }
+        }
+        std::array::from_fn(|c| acc[c].clamp(lo[c], hi[c]))
+    }
+
     /// Bilinear sample at continuous pixel coordinates (pixel centres at +0.5).
     #[inline]
     pub fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
@@ -253,9 +288,48 @@ impl Rgba8 {
     }
 }
 
+/// Catmull-Rom weights for the four taps around a sample `t` ∈ [0, 1) past the second one.
+#[inline]
+pub fn catmull_rom(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cubic_keeps_detail_without_overshoot() {
+        // a one-pixel stripe pattern, sampled a quarter pixel off the pixel centres
+        let mut img = Rgb32f::new(16, 4);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            *p = if (i % 16) % 2 == 0 { [1.0; 3] } else { [0.0; 3] };
+        }
+        let contrast = |f: &dyn Fn(f32) -> f32| {
+            (4..12).map(|x| f(x as f32 + 0.75)).fold(0f32, f32::max) - (4..12).map(|x| f(x as f32 + 0.75)).fold(1f32, f32::min)
+        };
+        let bil = contrast(&|x| img.sample_bilinear(x, 2.0)[0]);
+        let cub = contrast(&|x| img.sample_cubic(x, 2.0)[0]);
+        assert!(cub > bil * 1.15, "cubic {cub} vs bilinear {bil}");
+        // a step edge: never outside the neighbours' range
+        let mut step = Rgb32f::new(8, 2);
+        for (i, p) in step.data.iter_mut().enumerate() {
+            *p = if i % 8 < 4 { [0.2; 3] } else { [0.8; 3] };
+        }
+        for k in 0..32 {
+            let v = step.sample_cubic(2.0 + k as f32 * 0.125, 1.0)[1];
+            assert!((0.2..=0.8).contains(&v), "{v}");
+        }
+        // pixel centres are exact, a linear ramp stays linear
+        let mut ramp = Rgb32f::new(8, 1);
+        for (i, p) in ramp.data.iter_mut().enumerate() {
+            *p = [i as f32; 3];
+        }
+        assert!((ramp.sample_cubic(3.5, 0.5)[0] - 3.0).abs() < 1e-6);
+        assert!((ramp.sample_cubic(3.8, 0.5)[0] - 3.3).abs() < 1e-5);
+    }
     use lightcraft_geom::Orientation;
 
     #[test]
