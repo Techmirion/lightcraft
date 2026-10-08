@@ -1199,69 +1199,104 @@ pub fn run_batch(
     let single = items.len() == 1;
     let mut taken = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for (i, item) in items.into_iter().enumerate() {
-        if !progress(i, &item.file_name) {
-            break;
-        }
-        let (photo, name, guard) = (item.photo, item.file_name.clone(), item.guard.clone());
-        let e = match item.run() {
-            Ok(e) => e,
-            Err(err) if stop_on_error => return Err(err),
-            Err(err) => {
-                out.push(json!({"photo": photo.0, "file": name, "error": err}));
-                continue;
+    // Pipelined: the next photos decode and render on worker threads while this one is encoded and
+    // written (decode and JPEG encoding are CPU-bound, the render is on the GPU when there is one);
+    // results are still taken and written in order.
+    let lookahead = if items.len() > 1 { export_lookahead() } else { 0 };
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut pending = std::collections::VecDeque::new();
+        let mut queue = items.into_iter().enumerate();
+        loop {
+            while pending.len() <= lookahead {
+                let Some((i, item)) = queue.next() else { break };
+                let (photo, name, guard) = (item.photo, item.file_name.clone(), item.guard.clone());
+                let job = if lookahead == 0 { Pending::Done(item.run()) } else { Pending::Running(scope.spawn(move || item.run())) };
+                pending.push_back((i, photo, name, guard, job));
             }
-        };
-        // the exported file and its sidecars
-        let group = |main: &str| std::iter::once(main.to_string()).chain(e.sidecars.iter().map(|(x, _)| sidecar_path(main, x))).collect::<Vec<_>>();
-        let path = match to.exact.as_deref().filter(|_| single) {
-            Some(p) => Ok(p.to_string()),
-            None => {
-                let path = join(&dir, &e.file_name);
-                let busy = |main: &str| group(main).iter().any(|p| taken.contains(p) || exists(p));
-                if !busy(&path) {
-                    Ok(path)
-                } else {
-                    match o.conflict {
-                        Conflict::Overwrite => Ok(path),
-                        Conflict::Skip => {
-                            out.push(json!({"skipped": path}));
-                            continue;
-                        }
-                        Conflict::Unique => {
-                            let (stem, ext) = e.file_name.rsplit_once('.').map_or((e.file_name.as_str(), None), |(a, b)| (a, Some(b)));
-                            let name = |n: usize| join(&dir, &ext.map_or(format!("{stem}-{n}"), |x| format!("{stem}-{n}.{x}")));
-                            (2..1_000_000).map(name).find(|p| !busy(p)).ok_or_else(|| format!("{path}: no free file name"))
+            let Some((i, photo, name, guard, job)) = pending.pop_front() else { break };
+            if !progress(i, &name) {
+                break;
+            }
+            let result = match job {
+                Pending::Done(r) => r,
+                Pending::Running(h) => h.join().unwrap_or_else(|_| Err(format!("{name}: export failed (worker panicked)"))),
+            };
+            let e = match result {
+                Ok(e) => e,
+                Err(err) if stop_on_error => return Err(err),
+                Err(err) => {
+                    out.push(json!({"photo": photo.0, "file": name, "error": err}));
+                    continue;
+                }
+            };
+            // the exported file and its sidecars
+            let group =
+                |main: &str| std::iter::once(main.to_string()).chain(e.sidecars.iter().map(|(x, _)| sidecar_path(main, x))).collect::<Vec<_>>();
+            let path = match to.exact.as_deref().filter(|_| single) {
+                Some(p) => Ok(p.to_string()),
+                None => {
+                    let path = join(&dir, &e.file_name);
+                    let busy = |main: &str| group(main).iter().any(|p| taken.contains(p) || exists(p));
+                    if !busy(&path) {
+                        Ok(path)
+                    } else {
+                        match o.conflict {
+                            Conflict::Overwrite => Ok(path),
+                            Conflict::Skip => {
+                                out.push(json!({"skipped": path}));
+                                continue;
+                            }
+                            Conflict::Unique => {
+                                let (stem, ext) = e.file_name.rsplit_once('.').map_or((e.file_name.as_str(), None), |(a, b)| (a, Some(b)));
+                                let name = |n: usize| join(&dir, &ext.map_or(format!("{stem}-{n}"), |x| format!("{stem}-{n}.{x}")));
+                                (2..1_000_000).map(name).find(|p| !busy(p)).ok_or_else(|| format!("{path}: no free file name"))
+                            }
                         }
                     }
                 }
+            };
+            let file = path.clone().unwrap_or_else(|_| name.clone());
+            let written = path.and_then(|path| {
+                let files = group(&path);
+                // never over an original, whatever the conflict policy or the exact path said
+                for f in &files {
+                    guard.check(std::path::Path::new(f))?;
+                }
+                write(&path, &e.bytes)?;
+                let mut sidecars = Vec::new();
+                for ((_, bytes), sc) in e.sidecars.iter().zip(files.iter().skip(1)) {
+                    write(sc, bytes)?;
+                    sidecars.push(sc.clone());
+                }
+                Ok((path, files, sidecars))
+            });
+            match written {
+                Ok((path, files, sidecars)) => {
+                    taken.extend(files);
+                    out.push(json!({"path": path, "width": e.width, "height": e.height, "bytes": e.bytes.len(), "sidecars": sidecars}));
+                }
+                Err(err) if stop_on_error => return Err(err),
+                Err(err) => out.push(json!({"photo": photo.0, "file": file, "error": err})),
             }
-        };
-        let file = path.clone().unwrap_or_else(|_| name.clone());
-        let written = path.and_then(|path| {
-            let files = group(&path);
-            // never over an original, whatever the conflict policy or the exact path said
-            for f in &files {
-                guard.check(std::path::Path::new(f))?;
-            }
-            write(&path, &e.bytes)?;
-            let mut sidecars = Vec::new();
-            for ((_, bytes), sc) in e.sidecars.iter().zip(files.iter().skip(1)) {
-                write(sc, bytes)?;
-                sidecars.push(sc.clone());
-            }
-            Ok((path, files, sidecars))
-        });
-        match written {
-            Ok((path, files, sidecars)) => {
-                taken.extend(files);
-                out.push(json!({"path": path, "width": e.width, "height": e.height, "bytes": e.bytes.len(), "sidecars": sidecars}));
-            }
-            Err(err) if stop_on_error => return Err(err),
-            Err(err) => out.push(json!({"photo": photo.0, "file": file, "error": err})),
         }
-    }
+        Ok(())
+    })?;
     Ok(out)
+}
+
+/// A batch item being exported: already done (no worker threads) or running on one.
+enum Pending<'scope> {
+    Done(Result<Exported, String>),
+    Running(std::thread::ScopedJoinHandle<'scope, Result<Exported, String>>),
+}
+
+/// How many photos a batch export prepares ahead of the one being written: 2 on native builds
+/// (`LIGHTCRAFT_EXPORT_AHEAD=n` to change, 0 = one at a time), 0 in the browser (no threads).
+fn export_lookahead() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        return 0;
+    }
+    std::env::var("LIGHTCRAFT_EXPORT_AHEAD").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2, |n| n.min(8))
 }
 
 #[cfg(test)]
