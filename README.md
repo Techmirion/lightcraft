@@ -1,3 +1,5 @@
+> **Techmirion fork** of [storytold/lightcraft](https://github.com/storytold/lightcraft): GPU raw development, exposure stacking, Nikon D3500 support and faster browsing of large libraries. What is different and how we keep in step with upstream: [FORK.md](FORK.md). Not affiliated with or endorsed by the ArtCraft team.
+
 <p align="center">
   <a href="https://getartcraft.com/">
     <picture>

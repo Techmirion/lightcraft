@@ -1,4 +1,4 @@
-//! Lens profiles for raws that carry no lens corrections of their own (personal fork, Marios).
+//! Lens profiles for raws that carry no lens corrections of their own (Techmirion fork; see FORK.md).
 //!
 //! DNG files bring `WarpRectilinear` / `FixVignetteRadial` opcodes ([`crate::files::embedded_lens`]); Nikon DSLR
 //! NEFs bring nothing. A lens profile here describes one lens with the three lensfun-style models, per focal
