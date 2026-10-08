@@ -311,7 +311,28 @@ pub fn expand(paths: &[String], skip: Option<&Path>) -> Vec<String> {
     }
     let mut seen = std::collections::HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
+    if std::env::var_os("LIGHTCRAFT_RAW_JPEG_SEPARATE").is_none() {
+        drop_raw_jpeg_twins(&mut out, paths);
+    }
     out
+}
+
+/// RAW + JPEG shooting: like Lightroom's default, a JPEG found in a folder next to a raw file with the same name
+/// (`DSC_0001.NEF` + `DSC_0001.JPG`) is the camera's twin of that raw, not a separate photo, and is left out.
+/// Files named explicitly are always kept; `LIGHTCRAFT_RAW_JPEG_SEPARATE=1` keeps every JPEG.
+fn drop_raw_jpeg_twins(files: &mut Vec<String>, named: &[String]) {
+    const RAW: &[&str] = &["dng", "cr2", "cr3", "nef", "nrw", "arw", "raf", "orf", "rw2", "rwl", "raw", "pef"];
+    let ext = |p: &Path| p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let key = |p: &Path| p.with_extension("").to_string_lossy().to_lowercase();
+    let raws: std::collections::HashSet<String> = files.iter().map(Path::new).filter(|p| RAW.contains(&ext(p).as_str())).map(key).collect();
+    if raws.is_empty() {
+        return;
+    }
+    let named: std::collections::HashSet<&str> = named.iter().map(String::as_str).collect();
+    files.retain(|f| {
+        let p = Path::new(f);
+        !(matches!(ext(p).as_str(), "jpg" | "jpeg") && !named.contains(f.as_str()) && raws.contains(&key(p)))
+    });
 }
 
 /// Probe files (headers + content hash) as an import would.
@@ -1019,5 +1040,25 @@ impl Session {
     pub fn with_system_clock(mut self) -> Self {
         self.clock = Box::new(system_clock);
         self
+    }
+}
+
+#[cfg(test)]
+mod raw_jpeg_tests {
+    #[test]
+    fn jpeg_twin_of_raw_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("lc-rawjpeg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["DSC_0001.NEF", "DSC_0001.JPG", "DSC_0002.JPG", "dsc_0003.nef", "DSC_0003.jpeg"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let got = super::expand(&[dir.to_string_lossy().to_string()], None);
+        let names: Vec<String> = got.iter().map(|p| std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["DSC_0001.NEF", "DSC_0002.JPG", "dsc_0003.nef"]);
+        // a JPEG named explicitly is kept
+        let jpg = dir.join("DSC_0001.JPG").to_string_lossy().to_string();
+        let nef = dir.join("DSC_0001.NEF").to_string_lossy().to_string();
+        assert_eq!(super::expand(&[nef.clone(), jpg.clone()], None), [nef, jpg]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
