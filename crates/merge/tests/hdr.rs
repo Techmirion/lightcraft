@@ -77,7 +77,7 @@ fn bracket_merge_recovers_radiance_and_alignment() {
     let ks = [0.25f32, 1.0, 4.0];
     let frames: Vec<Frame> = (0..3).map(|i| shoot(&t, ks[i], shifts[i].0, shifts[i].1, i as u64 + 1)).collect();
     let t0 = std::time::Instant::now();
-    let r = merge_hdr(frames, &HdrOptions { align: true, deghost: Deghost::None }, &no_progress).unwrap();
+    let r = merge_hdr(frames, &HdrOptions { align: true, deghost: Deghost::None, ..Default::default() }, &no_progress).unwrap();
     eprintln!("merge {W}x{H}: {:?}", t0.elapsed());
     assert_eq!(r.reference, 1);
     // exposure estimates within 0.02 EV of the truth
@@ -145,9 +145,9 @@ fn deghost_removes_a_moving_object() {
         }
         v.iter().sum::<f32>() / v.len() as f32
     };
-    let none = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::None }, &no_progress).unwrap();
-    let high = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::High }, &no_progress).unwrap();
-    let med = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::Medium }, &no_progress).unwrap();
+    let none = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::None, ..Default::default() }, &no_progress).unwrap();
+    let high = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::High, ..Default::default() }, &no_progress).unwrap();
+    let med = merge_hdr(frames(()), &HdrOptions { align: false, deghost: Deghost::Medium, ..Default::default() }, &no_progress).unwrap();
     for (cx, cy) in [pos[0], pos[2]] {
         let (en, eh, em) = (err_at(&none.radiance, cx, cy), err_at(&high.radiance, cx, cy), err_at(&med.radiance, cx, cy));
         eprintln!("ghost at ({cx},{cy}): none {en:.3}, medium {em:.3}, high {eh:.3}");
@@ -160,4 +160,70 @@ fn deghost_removes_a_moving_object() {
     assert!(none.ghost.data.is_empty());
     let mean = high.ghost.data.iter().sum::<f32>() / high.ghost.data.len() as f32;
     assert!(mean < 0.08, "the overlay is local (mean {mean})");
+}
+
+/// A handheld burst at one exposure with a passer-by in one frame: Average cuts the noise,
+/// Median and SigmaClip remove the passer-by, Lighten keeps it.
+#[test]
+fn burst_stacking_modes() {
+    use lightcraft_merge::hdr::StackMode;
+    let t = truth();
+    // noisy, dark exposure (high-ISO burst)
+    let k = 0.25f32;
+    // tripod burst (alignment is covered by the bracket test): the noise reduction itself
+    let shifts = [(0.0f32, 0.0f32); 7];
+    let frames = || -> Vec<Frame> {
+        (0..shifts.len())
+            .map(|i| {
+                let scene = if i == 4 { with_object(&t, 200.0, 150.0, 30.0, [0.9, 0.1, 0.1]) } else { t.clone() };
+                shoot(&scene, k, shifts[i].0, shifts[i].1, 100 + i as u64)
+            })
+            .collect()
+    };
+    let run = |mode| merge_hdr(frames(), &HdrOptions { align: false, deghost: Deghost::None, mode }, &no_progress).unwrap();
+    // reference = the frame chosen by the merge (all equal exposure: the middle one, unshifted
+    // frame index order) — compare in its geometry: truth shifted like that frame
+    let one = run(StackMode::Hdr);
+    let (rdx, rdy) = shifts[one.reference];
+    // the merge is in the reference frame's units (its exposure k)
+    let truth_at = |x: usize, y: usize| t.sample_bilinear(x as f32 + 0.5 + M as f32 - rdx, y as f32 + 0.5 + M as f32 - rdy).map(|v| v * k);
+    let noise = |img: &Rgb32f| {
+        // mean abs error vs truth on a central window away from the passer-by
+        let mut e = Vec::new();
+        for y in (20..400).step_by(3) {
+            for x in (20..620).step_by(3) {
+                if (x as f32 - 200.0).abs() < 60.0 && (y as f32 - 150.0).abs() < 60.0 {
+                    continue; // the passer-by
+                }
+                let p = img.get(x, y);
+                let q = truth_at(x, y);
+                // well-exposed pixels only (clipped ones are wrong for every method alike)
+                if q.iter().all(|v| *v < 0.7) {
+                    e.push((p[1] - q[1]).abs());
+                }
+            }
+        }
+        e.iter().sum::<f32>() / e.len() as f32
+    };
+    let single = shoot(&t, k, rdx, rdy, 999).image;
+    let avg = run(StackMode::Average);
+    let med = run(StackMode::Median);
+    let sig = run(StackMode::SigmaClip);
+    let lig = run(StackMode::Lighten);
+    let (n1, na, nm, ns) = (noise(&single), noise(&avg.radiance), noise(&med.radiance), noise(&sig.radiance));
+    eprintln!("noise: single {n1:.5}, average {na:.5}, median {nm:.5}, sigma-clip {ns:.5}");
+    assert!(na < 0.6 * n1, "average should cut the noise: {na} vs {n1}");
+    assert!(ns < 0.7 * n1, "sigma-clip should cut the noise: {ns} vs {n1}");
+    assert!(nm < 0.8 * n1, "median should cut some noise: {nm} vs {n1}");
+    // the passer-by (red disk, one frame of seven): gone with median / sigma-clip, kept by lighten
+    let red = |img: &Rgb32f| {
+        let (dx, dy) = shifts[one.reference];
+        let p = img.get((200.0 - M as f32 + dx) as usize, (150.0 - M as f32 + dy) as usize);
+        p[0] / (p[1] + 1e-4)
+    };
+    let base = red(&single);
+    eprintln!("red/green at the passer-by: single {base:.2}, median {:.2}, sigma {:.2}, lighten {:.2}", red(&med.radiance), red(&sig.radiance), red(&lig.radiance));
+    assert!(red(&med.radiance) < 1.5 * base.max(1.0), "median keeps the passer-by");
+    assert!(red(&sig.radiance) < 1.5 * base.max(1.0), "sigma-clip keeps the passer-by");
+    assert!(red(&lig.radiance) > 1.8 * base.max(1.0), "lighten loses the passer-by");
 }

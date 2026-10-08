@@ -47,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "HDR Merge",
             [],
             None,
-            "{ids?, align=true, deghost=none|low|medium|high, autoSettings=true, stack=false, preview=false, showOverlay=false, previewPath?}",
+            "{ids?, mode=hdr|average|median|sigmaClip|lighten|darken (hdr: exposure-weighted bracket merge; the others stack the aligned, exposure-normalised frames), align=true, deghost=none|low|medium|high, autoSettings=true, stack=false, preview=false, showOverlay=false, previewPath?}",
             can_merge,
             |s, p| run(s, "merge.hdr", p)
         ),

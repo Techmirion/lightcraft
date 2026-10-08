@@ -51,17 +51,115 @@ impl Deghost {
     }
 }
 
+/// How the aligned, exposure-normalised frames are combined per pixel.
+///
+/// - `Hdr`: exposure-weighted radiance (longer exposures count more, saturated pixels not at all):
+///   brackets → one high-dynamic-range image; for frames of equal exposure, a noise-reducing average.
+/// - `Average`: equal-weight mean of the unsaturated frames (burst noise reduction, long-exposure look).
+/// - `Median`: per-channel median of the unsaturated frames: removes things that move through the
+///   scene (people, cars) and averages noise less than `Average`.
+/// - `SigmaClip`: mean of the values within 2.5 robust standard deviations (1.4826 · MAD) of the
+///   median: nearly the noise reduction of `Average` with the outlier rejection of `Median`.
+/// - `Lighten` / `Darken`: per-channel maximum / minimum (star trails, light painting; removing
+///   bright passers-by).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StackMode {
+    #[default]
+    Hdr,
+    Average,
+    Median,
+    SigmaClip,
+    Lighten,
+    Darken,
+}
+
+impl StackMode {
+    /// Suffix of the merged file's name.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            StackMode::Hdr => "HDR",
+            StackMode::Average => "Stack-Average",
+            StackMode::Median => "Stack-Median",
+            StackMode::SigmaClip => "Stack-SigmaClip",
+            StackMode::Lighten => "Stack-Lighten",
+            StackMode::Darken => "Stack-Darken",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct HdrOptions {
     pub align: bool,
     pub deghost: Deghost,
+    pub mode: StackMode,
 }
 
 impl Default for HdrOptions {
     fn default() -> Self {
-        HdrOptions { align: true, deghost: Deghost::None }
+        HdrOptions { align: true, deghost: Deghost::None, mode: StackMode::Hdr }
     }
+}
+
+/// Most frames a stack takes (per-pixel work buffers).
+pub const MAX_FRAMES: usize = 256;
+
+/// Combine one pixel's candidate radiances (`vals`, `wts`: weights > 0) with a non-HDR mode.
+/// `scratch` is reused across pixels. `None` when there is no candidate.
+fn combine(mode: StackMode, vals: &[[f32; 3]], wts: &[f32], scratch: &mut Vec<f32>) -> Option<[f32; 3]> {
+    if vals.is_empty() {
+        return None;
+    }
+    let mut out = [0f32; 3];
+    for c in 0..3 {
+        out[c] = match mode {
+            StackMode::Hdr | StackMode::Average => {
+                let (mut a, mut ws) = (0f64, 0f64);
+                for (v, w) in vals.iter().zip(wts) {
+                    a += f64::from(v[c] * w);
+                    ws += f64::from(*w);
+                }
+                if ws > 0.0 { (a / ws) as f32 } else { vals[0][c] }
+            }
+            StackMode::Lighten => vals.iter().map(|v| v[c]).fold(f32::MIN, f32::max),
+            StackMode::Darken => vals.iter().map(|v| v[c]).fold(f32::MAX, f32::min),
+            StackMode::Median | StackMode::SigmaClip => {
+                scratch.clear();
+                scratch.extend(vals.iter().map(|v| v[c]));
+                let med = median(scratch);
+                if mode == StackMode::Median {
+                    med
+                } else {
+                    // robust spread: 1.4826 · median absolute deviation
+                    for x in scratch.iter_mut() {
+                        *x = (*x - med).abs();
+                    }
+                    let sigma = 1.4826 * median(scratch);
+                    let lim = 2.5 * sigma;
+                    let (mut a, mut n) = (0f64, 0u32);
+                    for v in vals {
+                        if (v[c] - med).abs() <= lim {
+                            a += f64::from(v[c]);
+                            n += 1;
+                        }
+                    }
+                    if n > 0 { (a / f64::from(n)) as f32 } else { med }
+                }
+            }
+        };
+    }
+    Some(out)
+}
+
+/// Median of `v` (reordered in place); the mean of the middle two for an even count.
+fn median(v: &mut [f32]) -> f32 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    v.sort_unstable_by(f32::total_cmp);
+    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
 }
 
 /// The merged result, in the reference frame's geometry and units.
@@ -102,6 +200,10 @@ pub fn merge_hdr(mut frames: Vec<Frame>, opts: &HdrOptions, progress: &Progress)
     if n < 2 {
         return Err(MergeError::TooFew(n, 2));
     }
+    if n > MAX_FRAMES {
+        return Err(MergeError::Mismatch(format!("{n} photos: a merge takes at most {MAX_FRAMES}")));
+    }
+    let mode = opts.mode;
     let (w, h) = (frames[0].width(), frames[0].height());
     if frames.iter().any(|f| f.width() != w || f.height() != h) {
         return Err(MergeError::Mismatch("HDR merge needs photos of the same size".into()));
@@ -209,8 +311,53 @@ pub fn merge_hdr(mut frames: Vec<Frame>, opts: &HdrOptions, progress: &Progress)
     let vd = &valid;
     let gs = ghost_small.as_ref();
     out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        // non-HDR modes: the pixel's candidates (exposure-normalised) and their weights
+        let mut cand: Vec<[f32; 3]> = Vec::with_capacity(n);
+        let mut cw: Vec<f32> = Vec::with_capacity(n);
+        let mut all: Vec<[f32; 3]> = Vec::with_capacity(n);
+        let mut scratch: Vec<f32> = Vec::with_capacity(n);
         for x in 0..w {
             let i_px = y * w + x;
+            if mode != StackMode::Hdr {
+                cand.clear();
+                cw.clear();
+                all.clear();
+                for i in 0..n {
+                    if vd[i].as_ref().is_some_and(|v| !v[i_px]) {
+                        continue;
+                    }
+                    let v = fr[i].image.data[i_px];
+                    let inv = 1.0 / k[i];
+                    let r = v.map(|c| c * inv);
+                    let mut wt = 1.0 - smoothstep(0.80 * clips[i], 0.96 * clips[i], maxc(v));
+                    if i != reference
+                        && let Some((maps, fac)) = gs
+                    {
+                        wt *= 1.0 - sample_plane(&maps[i], (x as f32 + 0.5) / *fac as f32, (y as f32 + 0.5) / *fac as f32);
+                    }
+                    all.push(r);
+                    if wt > 0.5 || (mode == StackMode::Average && wt > 0.0) {
+                        cand.push(r);
+                        cw.push(wt);
+                    }
+                }
+                // Lighten / Darken take every frame (a saturated star is still the brightest);
+                // the others only unsaturated, unmasked ones, else every frame
+                let (vals, wts): (&[[f32; 3]], &[f32]) = match mode {
+                    StackMode::Lighten | StackMode::Darken => (&all, &[]),
+                    _ if cand.is_empty() => (&all, &[]),
+                    _ => (&cand, &cw),
+                };
+                let ones;
+                let wts = if wts.len() == vals.len() {
+                    wts
+                } else {
+                    ones = vec![1f32; vals.len()];
+                    &ones
+                };
+                row[x] = combine(mode, vals, wts, &mut scratch).unwrap_or(fr[reference].image.data[i_px]);
+                continue;
+            }
             let mut acc = [0f64; 3];
             let mut ws = 0f64;
             for i in 0..n {
@@ -446,4 +593,32 @@ fn dilate(p: &Plane, r: usize) -> Plane {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    #[test]
+    fn combine_modes() {
+        let vals = [[1.0, 1.0, 1.0], [1.1, 0.9, 1.0], [0.9, 1.1, 1.0], [5.0, 1.0, 1.0], [1.0, 1.0, 1.05]];
+        let wts = [1.0; 5];
+        let mut s = Vec::new();
+        let m = combine(StackMode::Median, &vals, &wts, &mut s).unwrap();
+        assert_eq!(m, [1.0, 1.0, 1.0]);
+        let a = combine(StackMode::Average, &vals, &wts, &mut s).unwrap();
+        assert!((a[0] - 1.8).abs() < 1e-5);
+        // the outlier (5.0) is rejected, the rest averaged
+        let c = combine(StackMode::SigmaClip, &vals, &wts, &mut s).unwrap();
+        assert!((c[0] - 1.0).abs() < 1e-5, "{c:?}");
+        assert_eq!(combine(StackMode::Lighten, &vals, &wts, &mut s).unwrap()[0], 5.0);
+        assert_eq!(combine(StackMode::Darken, &vals, &wts, &mut s).unwrap()[1], 0.9);
+        assert!(combine(StackMode::Median, &[], &[], &mut s).is_none());
+    }
+
+    #[test]
+    fn median_even_and_odd() {
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&mut [4.0, 1.0, 2.0, 3.0]), 2.5);
+    }
 }

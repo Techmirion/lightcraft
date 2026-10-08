@@ -27,6 +27,8 @@ pub struct MergeDialog {
     pub align: bool,
     /// none | low | medium | high
     pub deghost: String,
+    /// hdr | average | median | sigmaClip | lighten | darken (HDR merge only)
+    pub mode: String,
     pub show_overlay: bool,
     pub auto_settings: bool,
     pub stack: bool,
@@ -45,6 +47,7 @@ impl Default for MergeDialog {
             command: "merge.hdr".into(),
             align: true,
             deghost: "none".into(),
+            mode: "hdr".into(),
             show_overlay: false,
             auto_settings: true,
             stack: false,
@@ -343,6 +346,22 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, opts: &mut MergeDialog) 
                 }
                 ui.checkbox(&mut opts.fill_edges, crate::i18n::tr("Fill Edges"));
                 ui.checkbox(&mut opts.auto_crop, crate::i18n::tr("Auto Crop"));
+                ui.add_space(4.0);
+            }
+            if opts.command == "merge.hdr" {
+                ui.label(egui::RichText::new(crate::i18n::tr("Method")).color(t.text_label));
+                for (v, l) in [
+                    ("hdr", "HDR (exposure brackets)"),
+                    ("average", "Stack: Average (less noise)"),
+                    ("sigmaClip", "Stack: Average, reject outliers"),
+                    ("median", "Stack: Median (remove movers)"),
+                    ("lighten", "Stack: Lighten (trails)"),
+                    ("darken", "Stack: Darken"),
+                ] {
+                    if ui.radio(opts.mode == v, crate::i18n::tr(l)).clicked() {
+                        opts.mode = v.to_string();
+                    }
+                }
                 ui.add_space(4.0);
             }
             if opts.is_hdr() {

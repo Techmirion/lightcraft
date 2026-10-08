@@ -399,9 +399,59 @@ pub fn embedded_preview_srgb(bytes: &[u8], max_edge: usize) -> Option<lightcraft
     Some(d.to_srgb8().oriented(o))
 }
 
-/// Filesystem-backed embedded-preview hook (native).
+/// Filesystem-backed embedded-preview hook (native): reads only the raw's head (its IFDs) and the
+/// one embedded JPEG it uses — the smallest that covers `max_edge` (a 640 px preview for a grid
+/// tile instead of the camera's full-size JPEG) — not the whole 25 MB file.
 pub fn fs_preview_loader() -> PreviewLoader {
-    Arc::new(|path: &str, max_edge: usize| embedded_preview_srgb(&std::fs::read(path).ok()?, max_edge))
+    Arc::new(|path: &str, max_edge: usize| {
+        fast_embedded_preview(path, max_edge).or_else(|| embedded_preview_srgb(&std::fs::read(path).ok()?, max_edge))
+    })
+}
+
+/// Head of a raw file read for its IFDs ([`fs_preview_loader`]).
+const PREVIEW_HEAD: u64 = 512 << 10;
+
+/// [`embedded_preview_srgb`] reading only what it needs from `path`; `None` to fall back to a full read.
+pub fn fast_embedded_preview(path: &str, max_edge: usize) -> Option<lightcraft_raster::Rgba8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    // a sparse image of the file: the head, then whichever previews we pick (zeros elsewhere;
+    // a zeroed allocation costs nothing until written)
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    let head = len.min(PREVIEW_HEAD) as usize;
+    f.read_exact(buf.get_mut(..head)?).ok()?;
+    let mut read_range = |buf: &mut [u8], off: usize, n: usize| -> Option<()> {
+        let end = off.checked_add(n)?.min(buf.len());
+        if end <= head || off >= end {
+            return Some(());
+        }
+        let off = off.max(head);
+        f.seek(SeekFrom::Start(off as u64)).ok()?;
+        f.read_exact(buf.get_mut(off..end)?).ok()
+    };
+    let ranges = lightcraft_raw::embedded_preview_ranges(&buf);
+    if ranges.is_empty() {
+        return None;
+    }
+    // each candidate's first 8 KB (markers, SOF) to learn its size, then the chosen one in full
+    for &(o, l) in &ranges {
+        read_range(&mut buf, o, l.min(8 << 10))?;
+    }
+    let want = max_edge.min(u32::MAX as usize) as u32;
+    let sized: Vec<((usize, usize), (u32, u32))> =
+        ranges.iter().filter_map(|&(o, l)| Some(((o, l), lightcraft_raw::jpeg_size(buf.get(o..o.checked_add(l)?.min(buf.len()))?)?))).collect();
+    let long = |d: &(u32, u32)| d.0.max(d.1);
+    let pick = sized.iter().filter(|(_, d)| long(d) >= want).min_by_key(|(_, d)| long(d)).or_else(|| sized.iter().max_by_key(|(_, d)| long(d)))?;
+    read_range(&mut buf, pick.0.0, pick.0.1)?;
+    let (jpeg, _) = lightcraft_raw::embedded_preview_at_least(&buf, long(&pick.1))?;
+    let mut d = lightcraft_codecs::decode(jpeg, lightcraft_codecs::DecodeOptions::fit(max_edge as u32, max_edge as u32)).ok()?;
+    if d.image.width.max(d.image.height) > max_edge {
+        d.image = fit(&d.image, max_edge, max_edge, Filter::Box);
+        d.alpha = None;
+    }
+    let o = preview_orientation(buf.get(..head)?, d.orientation);
+    Some(d.to_srgb8().oriented(o))
 }
 
 /// Filesystem-backed hooks (native). On the web the host installs bytes-based hooks instead.
@@ -640,5 +690,25 @@ mod gpu_raw_tests {
         let mean = sum / n as f64;
         println!("full-size load: gpu {t_gpu:?}, cpu {t_cpu:?}; mean |d| {mean:.2e}, max {max:.2e}, {big} of {n} values > 2e-3");
         assert!(mean < 1e-4 && (big as f64) < 1e-4 * n as f64);
+    }
+}
+
+#[cfg(test)]
+mod fast_preview_tests {
+    /// `LC_SAMPLE_NEF=… cargo test --release -p lightcraft-engine --lib fast_preview -- --nocapture`
+    #[test]
+    fn fast_preview_matches_and_is_faster() {
+        let Some(path) = std::env::var("LC_SAMPLE_NEF").ok() else { return };
+        for edge in [256usize, 512, 2560] {
+            let t = std::time::Instant::now();
+            let full = super::embedded_preview_srgb(&std::fs::read(&path).unwrap(), edge).unwrap();
+            let t_full = t.elapsed();
+            let t = std::time::Instant::now();
+            let fast = super::fast_embedded_preview(&path, edge).unwrap();
+            let t_fast = t.elapsed();
+            println!("edge {edge}: full read {t_full:?} → {}×{}, fast {t_fast:?} → {}×{}", full.width, full.height, fast.width, fast.height);
+            assert!(fast.width.max(fast.height) <= edge);
+            assert_eq!(fast.width as f32 / fast.height as f32 > 1.0, full.width as f32 / full.height as f32 > 1.0);
+        }
     }
 }

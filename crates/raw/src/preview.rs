@@ -61,6 +61,82 @@ fn candidates<'a>(data: &'a [u8], ifd: &Ifd, base: u64, out: &mut Vec<&'a [u8]>)
     }
 }
 
+/// Width and height from a JPEG's first SOF marker (`None` if not found within `b`).
+pub fn jpeg_size(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() < 4 || b[0] != 0xff || b[1] != 0xd8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 9 <= b.len() {
+        if b[i] != 0xff {
+            return None;
+        }
+        let m = b[i + 1];
+        if m == 0xff {
+            i += 1;
+            continue;
+        }
+        if matches!(m, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return (w > 0 && h > 0).then_some((w, h));
+        }
+        if matches!(m, 0xd9 | 0xda) {
+            return None;
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        i += 2 + len;
+    }
+    None
+}
+
+/// Byte ranges `(offset, length)` of the embedded JPEG candidates of a TIFF-based raw (NEF, ARW,
+/// CR2, DNG, PEF, ORF, RW2…), found from its IFDs alone: `bytes` only needs the file's head where
+/// the IFDs live (the rest may be zeros), so a caller can read just the preview it then picks.
+/// Empty for RAF / CR3 (use [`embedded_preview`]).
+pub fn embedded_preview_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+    if bytes.starts_with(b"FUJIFILMCCD-RAW") || crate::probe(bytes) == Some(crate::RawFormat::Cr3) {
+        return Vec::new();
+    }
+    let Ok(tiff) = Tiff::parse(bytes) else { return Vec::new() };
+    let mut found: Vec<&[u8]> = Vec::new();
+    for ifd in tiff.all_ifds() {
+        candidates(bytes, ifd, 0, &mut found);
+    }
+    if let Some(exif) = tiff.exif()
+        && let Some(e) = exif.get(t::MAKER_NOTE)
+    {
+        let make = tiff.find(t::MAKE).and_then(|e| e.value.as_str()).unwrap_or_default();
+        if let Some(mn) = makernote::parse_makernote(bytes, e.offset, e.count() as u64, tiff.order, &make) {
+            candidates(bytes, &mn.ifd, mn.base, &mut found);
+            if let Some(off) = mn.ifd.u64(0x0011)
+                && let Ok((pifd, _)) = lightcraft_tiff::parse_ifd_at(bytes, mn.base + off, mn.order, mn.base, false, &Default::default())
+            {
+                candidates(bytes, &pifd, mn.base, &mut found);
+            }
+        }
+    }
+    let base = bytes.as_ptr() as usize;
+    let mut out: Vec<(usize, usize)> = found.iter().map(|s| (s.as_ptr() as usize - base, s.len())).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The smallest valid embedded JPEG whose long edge is at least `min_edge` (else the largest), as
+/// a slice of `bytes`, with its size. Grid thumbnails then decode a 640 px preview instead of the
+/// full-size one.
+pub fn embedded_preview_at_least(bytes: &[u8], min_edge: u32) -> Option<(&[u8], (u32, u32))> {
+    let all: Vec<(&[u8], (u32, u32))> = embedded_preview_ranges(bytes)
+        .into_iter()
+        .filter_map(|(o, l)| bytes.get(o..o.checked_add(l)?))
+        .filter(|s| is_dct_jpeg(s))
+        .filter_map(|s| Some((trim_eoi(s), jpeg_size(s)?)))
+        .collect();
+    let long = |d: &(u32, u32)| d.0.max(d.1);
+    all.iter().filter(|(_, d)| long(d) >= min_edge).min_by_key(|(_, d)| long(d)).or_else(|| all.iter().max_by_key(|(_, d)| long(d))).copied()
+}
+
 /// The largest embedded JPEG preview, if any.
 pub fn embedded_preview(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.starts_with(b"FUJIFILMCCD-RAW") {
@@ -217,5 +293,17 @@ mod tests {
         // a track pointing past the end falls back to PRVW
         file.truncate(at as usize + 100);
         assert_eq!(embedded_preview(&file).unwrap(), small);
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn jpeg_size_reads_sof() {
+        // SOI, APP0 (len 4), SOF0 (h=424, w=640)
+        let b = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0xa8, 0x02, 0x80, 0x03];
+        assert_eq!(super::jpeg_size(&b), Some((640, 424)));
+        assert_eq!(super::jpeg_size(&[0xff, 0xd8]), None);
+        assert_eq!(super::jpeg_size(&[0x00; 16]), None);
     }
 }

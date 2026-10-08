@@ -63,17 +63,42 @@ fn jobs_for(s: &mut Session, id: lightcraft_catalog::PhotoId, edge: Option<usize
 }
 
 fn run_all(jobs: Vec<Vec<RenderJob>>, state: &PreviewBuild) {
-    for photo_jobs in jobs {
-        if state.cancel.load(Ordering::Relaxed) {
-            break;
+    // Several photos at once: decoding a raw is largely serial (one compressed stream), so one
+    // photo at a time left most cores idle. Each worker takes the next photo in order.
+    let workers = build_workers().min(jobs.len()).max(1);
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let work = || {
+        loop {
+            if state.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let next = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next();
+            let Some(photo_jobs) = next else { break };
+            let ok = photo_jobs.into_iter().all(|j| j.run().rendered.is_ok());
+            if !ok {
+                state.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            state.done.fetch_add(1, Ordering::Relaxed);
         }
-        let ok = photo_jobs.into_iter().all(|j| j.run().rendered.is_ok());
-        if !ok {
-            state.failed.fetch_add(1, Ordering::Relaxed);
-        }
-        state.done.fetch_add(1, Ordering::Relaxed);
+    };
+    if workers <= 1 || cfg!(target_arch = "wasm32") {
+        work();
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..workers {
+                sc.spawn(work);
+            }
+        });
     }
     state.finished.store(true, Ordering::Relaxed);
+}
+
+/// Photos rendered at once by a preview build: half the cores (2..=8), `LIGHTCRAFT_PREVIEW_WORKERS` to override.
+fn build_workers() -> usize {
+    if let Some(n) = std::env::var("LIGHTCRAFT_PREVIEW_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 32);
+    }
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
 }
 
 fn build(s: &mut Session, p: &Value) -> Result<Value> {

@@ -43,7 +43,7 @@ pub enum MergeKind {
 impl MergeKind {
     fn suffix(&self) -> &'static str {
         match self {
-            MergeKind::Hdr { .. } => "HDR",
+            MergeKind::Hdr { hdr } => hdr.mode.suffix(),
             MergeKind::Panorama { .. } => "Pano",
             MergeKind::HdrPanorama { .. } => "HDR-Pano",
         }
@@ -110,7 +110,14 @@ impl MergeJob {
             .par_iter()
             .map(|(_, path)| {
                 let bytes = (self.read)(path)?;
-                let f = lightcraft_merge::load_frame(&bytes, self.preview, orient).map_err(|e| format!("{path}: {e}"));
+                // full-size raws demosaic on the GPU when there is one
+                let gpu = |n: &lightcraft_raw::Normalized| -> Option<lightcraft_raster::Rgb32f> {
+                    let cfa = n.cfa.as_ref().filter(|c| c.width == 2 && c.height == 2 && n.cpp == 1)?;
+                    let pattern: [u8; 4] = cfa.pattern.as_slice().try_into().ok()?;
+                    let data = lightcraft_gpu::demosaic_ahd(n.width, n.height, &n.data, pattern)?;
+                    Some(lightcraft_raster::Rgb32f { width: n.width, height: n.height, data })
+                };
+                let f = lightcraft_merge::load_frame_with(&bytes, self.preview, orient, &gpu).map_err(|e| format!("{path}: {e}"));
                 let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 progress(span.0 + (span.1 - span.0) * k as f32 / n as f32, "Reading photos");
                 f
@@ -124,6 +131,20 @@ impl MergeJob {
         if self.sources.len() < self.kind.min_photos() {
             return Err(format!("select at least {} photos", self.kind.min_photos()));
         }
+        // LIGHTCRAFT_PROFILE=1: time per merge stage on stderr
+        let t0 = std::time::Instant::now();
+        let last = std::sync::Mutex::new(String::new());
+        let profiled = |f: f32, s: &str| {
+            if lightcraft_pipeline::profiling() {
+                let mut l = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *l != s {
+                    eprintln!("[profile] merge {:>7.0} ms  {s}", t0.elapsed().as_secs_f64() * 1e3);
+                    *l = s.to_string();
+                }
+            }
+            progress(f, s)
+        };
+        let progress: &ProgressFn = &profiled;
         if !progress(0.0, "Reading photos") {
             return Err("cancelled".into());
         }
@@ -317,7 +338,9 @@ fn output_names(first: &str, suffix: &str) -> impl Iterator<Item = std::path::Pa
 pub fn parse(id: &str, p: &Value) -> Result<(MergeKind, MergeFinish)> {
     let bad = |m: String| EngineError::BadParams { cmd: id.into(), msg: m };
     let deghost: Deghost = serde_json::from_value(p.get("deghost").cloned().unwrap_or(json!("none"))).map_err(|e| bad(format!("deghost: {e}")))?;
-    let hdr = HdrOptions { align: p.get("align").and_then(Value::as_bool).unwrap_or(true), deghost };
+    let mode: lightcraft_merge::StackMode =
+        serde_json::from_value(p.get("mode").cloned().unwrap_or(json!("hdr"))).map_err(|e| bad(format!("mode: {e}")))?;
+    let hdr = HdrOptions { align: p.get("align").and_then(Value::as_bool).unwrap_or(true), deghost, mode };
     let projection: Projection =
         serde_json::from_value(p.get("projection").cloned().unwrap_or(json!("auto"))).map_err(|e| bad(format!("projection: {e}")))?;
     let pano = PanoOptions {

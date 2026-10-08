@@ -78,6 +78,8 @@ USAGE:
       Photo Merge: writes <first>-HDR.dng / -Pano.dng / -HDR-Pano.dng next to the first file and
       prints the result as JSON. Options:
         --deghost none|low|medium|high   --no-align   --bracket N (HDR panorama)
+        --mode hdr|average|median|sigmaClip|lighten|darken   (HDR: how frames combine; the
+          default hdr merges brackets, the others stack aligned, exposure-normalised frames)
         --projection auto|spherical|cylindrical|perspective   --boundary-warp 0..100
         --auto-crop   --fill-edges   --no-auto-settings
         --preview OUT.png   only render a ≤ 1024 px preview (nothing written next to the files)
@@ -344,6 +346,9 @@ fn merge(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--deghost" => {
                 p.insert("deghost".into(), json!(take_value(args, &mut i, "--deghost")?));
+            }
+            "--mode" => {
+                p.insert("mode".into(), json!(take_value(args, &mut i, "--mode")?));
             }
             "--no-align" => {
                 p.insert("align".into(), json!(false));

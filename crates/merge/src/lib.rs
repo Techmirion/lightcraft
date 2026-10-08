@@ -23,8 +23,8 @@ pub mod pano;
 pub mod ransac;
 pub mod synth;
 
-pub use frame::{Frame, FrameColor, load_frame};
-pub use hdr::{Deghost, HdrOptions, HdrResult, merge_hdr};
+pub use frame::{Frame, FrameColor, load_frame, load_frame_with};
+pub use hdr::{Deghost, HdrOptions, HdrResult, MAX_FRAMES, StackMode, merge_hdr};
 pub use output::{DngSamples, write_linear_dng};
 pub use pano::{PanoOptions, PanoResult, Projection, stitch};
 

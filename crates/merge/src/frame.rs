@@ -106,6 +106,17 @@ pub fn detect_clip(img: &Rgb32f) -> f32 {
 /// Decode a photo (raw or standard format) into a frame no larger than `max_edge` (when given).
 /// `orient` applies the EXIF orientation to the pixels.
 pub fn load_frame(bytes: &[u8], max_edge: Option<usize>, orient: bool) -> Result<Frame> {
+    load_frame_with(bytes, max_edge, orient, &|_| None)
+}
+
+/// [`load_frame`] with another AHD demosaicer tried first for full-size raws (e.g. the GPU's,
+/// see `lightcraft_raw::RawImage::develop_with`).
+pub fn load_frame_with(
+    bytes: &[u8],
+    max_edge: Option<usize>,
+    orient: bool,
+    demosaic: &(dyn Fn(&lightcraft_raw::Normalized) -> Option<lightcraft_raster::Rgb32f> + Sync),
+) -> Result<Frame> {
     let metadata = lightcraft_meta::extract(bytes);
     let exposure = exif_exposure(&metadata);
     if lightcraft_raw::probe(bytes).is_some() {
@@ -116,7 +127,8 @@ pub fn load_frame(bytes: &[u8], max_edge: Option<usize>, orient: bool) -> Result
             .retain(|op| !matches!(op, lightcraft_raw::Opcode::WarpRectilinear { .. } | lightcraft_raw::Opcode::FixVignetteRadial { .. }));
         let small = max_edge.is_some_and(|m| m <= 1200);
         let method = if small { lightcraft_raw::Method::Bilinear } else { lightcraft_raw::Method::Ahd };
-        let mut image = raw.develop(method).map_err(|e| MergeError::Decode(e.to_string()))?;
+        let mut image = if method == lightcraft_raw::Method::Ahd { raw.develop_with(method, demosaic) } else { raw.develop(method) }
+            .map_err(|e| MergeError::Decode(e.to_string()))?;
         for p in image.data.iter_mut() {
             *p = p.map(|v| v.max(0.0));
         }
