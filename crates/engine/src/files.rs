@@ -324,7 +324,7 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
         // non-integer ratios).
         let long = img.width.max(img.height);
         let img = if long > max_edge && long.saturating_mul(4) > max_edge.saturating_mul(5) {
-            fit(&img, max_edge, max_edge, Filter::Mitchell)
+            fit(&img, max_edge, max_edge, Filter::CatmullRom)
         } else {
             img
         };
@@ -447,7 +447,9 @@ pub fn fast_embedded_preview(path: &str, max_edge: usize) -> Option<lightcraft_r
     for &(o, l) in &ranges {
         read_range(&mut buf, o, l.min(8 << 10))?;
     }
-    let want = max_edge.min(u32::MAX as usize) as u32;
+    // a grid-sized tile comes from a preview at least twice its size: the camera's small
+    // thumbnail is heavily compressed, and a 2× reduction hides that and keeps edges crisp
+    let want = (if max_edge <= 512 { max_edge * 2 } else { max_edge }).min(u32::MAX as usize) as u32;
     let sized: Vec<((usize, usize), (u32, u32))> =
         ranges.iter().filter_map(|&(o, l)| Some(((o, l), lightcraft_raw::jpeg_size(buf.get(o..o.checked_add(l)?.min(buf.len()))?)?))).collect();
     let long = |d: &(u32, u32)| d.0.max(d.1);
@@ -456,7 +458,7 @@ pub fn fast_embedded_preview(path: &str, max_edge: usize) -> Option<lightcraft_r
     let (jpeg, _) = lightcraft_raw::embedded_preview_at_least(&buf, long(&pick.1))?;
     let mut d = lightcraft_codecs::decode(jpeg, lightcraft_codecs::DecodeOptions::fit(max_edge as u32, max_edge as u32)).ok()?;
     if d.image.width.max(d.image.height) > max_edge {
-        d.image = fit(&d.image, max_edge, max_edge, Filter::Box);
+        d.image = fit(&d.image, max_edge, max_edge, Filter::CatmullRom);
         d.alpha = None;
     }
     let o = preview_orientation(buf.get(..head)?, d.orientation);

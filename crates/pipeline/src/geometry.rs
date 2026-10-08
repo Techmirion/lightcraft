@@ -201,14 +201,32 @@ impl Frame {
         SamplePlan { ow, oh, prefilter, sx, sy, mode }
     }
 
-    /// Sample the source into a `w × h` output buffer: orientation, crop, rotation, flips — one
-    /// bicubic resample from a pre-filtered (area-downscaled) copy, so minification never aliases.
+    /// Whether [`Self::sample`] renders the geometry at twice the output size and reduces it
+    /// (when the source is minified *and* resampled through a crop, rotation or warp: resampling
+    /// at the final size would soften every such render by about a third).
+    pub fn supersample(&self, src_w: usize, src_h: usize, w: usize, h: usize) -> bool {
+        let plan = self.sample_plan(src_w, src_h, w, h);
+        plan.prefilter.is_some() && !matches!(plan.mode, SampleMode::Copy)
+    }
+
+    /// Sample the source into a `w × h` output buffer: orientation, crop, rotation, flips. A
+    /// minified render goes through a pre-filtered (area-downscaled) copy, so it never aliases,
+    /// and resamples its geometry at twice the size before the final reduction
+    /// ([`Self::supersample`]).
     pub fn sample(&self, src: &Rgb32f, w: usize, h: usize) -> Rgb32f {
+        if self.supersample(src.width, src.height, w, h) {
+            let big = self.sample_at(src, w.saturating_mul(2), h.saturating_mul(2));
+            return resize(&big, w, h, Filter::CatmullRom);
+        }
+        self.sample_at(src, w, h)
+    }
+
+    fn sample_at(&self, src: &Rgb32f, w: usize, h: usize) -> Rgb32f {
         let oriented = if self.orient == Orientation::Normal { None } else { Some(src.oriented(self.orient)) };
         let o = oriented.as_ref().unwrap_or(src);
         let plan = self.sample_plan(src.width, src.height, w, h);
         let base = match plan.prefilter {
-            Some((nw, nh)) => std::borrow::Cow::Owned(resize(o, nw, nh, Filter::Mitchell)),
+            Some((nw, nh)) => std::borrow::Cow::Owned(resize(o, nw, nh, Filter::CatmullRom)),
             None => std::borrow::Cow::Borrowed(o),
         };
         let affine = |xf: Affine| {

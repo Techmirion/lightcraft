@@ -7,6 +7,8 @@ pub enum Filter {
     Box,
     Bilinear,
     Mitchell,
+    /// Cubic B = 0, C = ½: sharper than Mitchell, much less ringing than Lanczos.
+    CatmullRom,
     Lanczos3,
 }
 
@@ -15,7 +17,7 @@ impl Filter {
         match self {
             Filter::Box => 0.5,
             Filter::Bilinear => 1.0,
-            Filter::Mitchell => 2.0,
+            Filter::Mitchell | Filter::CatmullRom => 2.0,
             Filter::Lanczos3 => 3.0,
         }
     }
@@ -30,8 +32,8 @@ impl Filter {
                 }
             }
             Filter::Bilinear => (1.0 - x).max(0.0),
-            Filter::Mitchell => {
-                let (b, c) = (1.0 / 3.0, 1.0 / 3.0);
+            Filter::Mitchell | Filter::CatmullRom => {
+                let (b, c) = if self == Filter::Mitchell { (1.0 / 3.0, 1.0 / 3.0) } else { (0.0, 0.5) };
                 if x < 1.0 {
                     ((12.0 - 9.0 * b - 6.0 * c) * x * x * x + (-18.0 + 12.0 * b + 6.0 * c) * x * x + (6.0 - 2.0 * b)) / 6.0
                 } else if x < 2.0 {

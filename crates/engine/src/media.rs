@@ -633,6 +633,16 @@ pub struct QuickJob {
     pub embedded: Option<(String, PreviewLoader, usize)>,
     /// Last resort: run this thumbnail job.
     pub small: Option<Box<RenderJob>>,
+    /// Fit a larger cached render down to this long edge (0: use it as it is). Lets a grid
+    /// thumbnail use the larger one built ahead of time (Library → Build Previews).
+    pub fit_edge: usize,
+}
+
+/// Fit an 8-bit sRGB image within `edge` (Catmull-Rom, in the encoded values: fine for a thumbnail).
+fn fit_rgba8(img: &Rgba8, edge: usize) -> Rgba8 {
+    let f = img.map(|p| p.map(|c| f32::from(c) / 255.0));
+    let f = lightcraft_raster::resample::fit(&f, edge, edge, lightcraft_raster::resample::Filter::CatmullRom);
+    f.map(|p| p.map(|c| (c * 255.0).round().clamp(0.0, 255.0) as u8))
 }
 
 impl QuickJob {
@@ -655,7 +665,9 @@ impl QuickJob {
         };
         for (cache, k) in &self.cached {
             if let Some(img) = cache.get(*k) {
-                return done(rendered(Arc::unwrap_or_clone(img)), Some(QuickSource::Cached));
+                let img = Arc::unwrap_or_clone(img);
+                let img = if self.fit_edge > 0 && img.width.max(img.height) > self.fit_edge { fit_rgba8(&img, self.fit_edge) } else { img };
+                return done(rendered(img), Some(QuickSource::Cached));
             }
         }
         if let Some((path, loader, edge)) = &self.embedded
@@ -899,25 +911,26 @@ impl crate::Session {
         let h = Hasher128::new().str(&content_key(&p)).str("quick").u64(p.develop.hash64()).u64(apply_crop as u64).finish();
         let key = h.0 as u64;
         let embedded = self.embedded_of(&p).map(|(path, l)| (path, l, max_edge.clamp(1, SourceLevel::Preview.max_edge())));
-        Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, small: apply_crop.then(|| Box::new(small)) })
+        Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, small: apply_crop.then(|| Box::new(small)), fit_edge: 0 })
     }
 
     /// A first grid thumbnail for an unedited raw: the cached render for `job` (the real
-    /// thumbnail job, from [`Self::thumb_job`]) if there is one — then the result carries
-    /// [`QuickSource::Cached`] and `job.key` and is final — else its embedded preview. `None` for
-    /// other photos (render them directly).
+    /// thumbnail job, from [`Self::thumb_job`]) if there is one, else the largest cached thumbnail
+    /// fitted down (Build Previews makes those) — then the result carries [`QuickSource::Cached`]
+    /// and `job.key` and is final — else its embedded preview. `None` for other photos (render
+    /// them directly).
     pub fn quick_thumb_job(&mut self, job: &RenderJob) -> Option<QuickJob> {
         let p = self.catalog.photo(job.photo)?.clone();
         let (path, l) = self.embedded_of(&p)?;
         let edge = job.request.max_w.max(job.request.max_h);
-        Some(QuickJob {
-            request_id: 0,
-            photo: job.photo,
-            key: job.key,
-            cached: job.cache.clone().into_iter().collect(),
-            embedded: Some((path, l, edge)),
-            small: None,
-        })
+        let mut cached: Vec<_> = job.cache.clone().into_iter().collect();
+        let largest = THUMB_SIZES[THUMB_SIZES.len() - 1];
+        if edge < largest
+            && let Some(big) = self.thumb_job(job.photo, largest).and_then(|j| j.cache)
+        {
+            cached.push(big);
+        }
+        Some(QuickJob { request_id: 0, photo: job.photo, key: job.key, cached, embedded: Some((path, l, edge)), small: None, fit_edge: edge })
     }
 
     /// Accept a finished job's loaded source into the cache.

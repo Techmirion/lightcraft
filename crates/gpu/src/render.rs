@@ -451,6 +451,16 @@ fn coverage_mask(wp: &lightcraft_pipeline::optics::Warp, o2t: &lightcraft_geom::
 fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>) -> Arc<Buf> {
     let (w, h) = (plan.w, plan.h);
     let fr = &plan.frame;
+    // `Frame::sample`: a minified crop / rotation / warp is resampled at twice the size, then reduced
+    if fr.supersample(src.width, src.height, w, h) {
+        let (bw, bh) = (w.saturating_mul(2), h.saturating_mul(2));
+        let big = sample_at(cx, src, src_buf, fr, bw, bh);
+        return Arc::new(resize(cx, &big, (bw, bh), (w, h), 3, Filter::CatmullRom));
+    }
+    sample_at(cx, src, src_buf, fr, w, h)
+}
+
+fn sample_at(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, fr: &lightcraft_pipeline::geometry::Frame, w: usize, h: usize) -> Arc<Buf> {
     let sp = fr.sample_plan(src.width, src.height, w, h);
     let oriented = if fr.orient == Orientation::Normal {
         src_buf
@@ -462,7 +472,7 @@ fn sample(cx: &mut Cx<'_>, src: &Arc<Rgb32f>, src_buf: Arc<Buf>, plan: &Plan<'_>
         Arc::new(out)
     };
     let (base, (bw, bh)) = match sp.prefilter {
-        Some(d) => (Arc::new(resize(cx, &oriented, (sp.ow, sp.oh), d, 3, Filter::Mitchell)), d),
+        Some(d) => (Arc::new(resize(cx, &oriented, (sp.ow, sp.oh), d, 3, Filter::CatmullRom)), d),
         None => (oriented, (sp.ow, sp.oh)),
     };
     let mut affine = |xf: &lightcraft_geom::Affine| {
