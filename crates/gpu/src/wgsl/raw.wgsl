@@ -95,28 +95,26 @@ fn candidate(v: bool, x: i32, y: i32) -> vec3<f32> {
     let i = idx(x, y);
     let own = colour_at(x, y);
     let gg = g_dir(v, i);
-    var p = vec3<f32>(0.0, gg, 0.0);
+    // no dynamic writes into vector components: FXC (DX12) rejects them ("not natively addressable")
     if (own == 1u) {
         let ch = colour_at(x + 1, y);
-        let cv = colour_at(x, y + 1);
         let jl = idx(x - 1, y);
         let jr = idx(x + 1, y);
         let ju = idx(x, y - 1);
         let jd = idx(x, y + 1);
         let hval = gg + ((mos[jl] - g_dir(v, jl)) + (mos[jr] - g_dir(v, jr))) * 0.5;
         let vval = gg + ((mos[ju] - g_dir(v, ju)) + (mos[jd] - g_dir(v, jd))) * 0.5;
-        p[ch] = hval;
-        p[cv] = vval;
-    } else {
-        p[own] = mos[i];
-        let a = idx(x - 1, y - 1);
-        let b = idx(x + 1, y - 1);
-        let c = idx(x - 1, y + 1);
-        let d = idx(x + 1, y + 1);
-        let s = (mos[a] - g_dir(v, a)) + (mos[b] - g_dir(v, b)) + (mos[c] - g_dir(v, c)) + (mos[d] - g_dir(v, d));
-        p[2u - own] = gg + s * 0.25;
+        // the row neighbour's colour takes the horizontal estimate, the other one the vertical
+        return vec3<f32>(select(vval, hval, ch == 0u), gg, select(vval, hval, ch == 2u));
     }
-    return p;
+    let a = idx(x - 1, y - 1);
+    let b = idx(x + 1, y - 1);
+    let c = idx(x - 1, y + 1);
+    let d = idx(x + 1, y + 1);
+    let s = (mos[a] - g_dir(v, a)) + (mos[b] - g_dir(v, b)) + (mos[c] - g_dir(v, c)) + (mos[d] - g_dir(v, d));
+    let other = gg + s * 0.25;
+    let own_v = mos[i];
+    return vec3<f32>(select(other, own_v, own == 0u), gg, select(other, own_v, own == 2u));
 }
 
 fn lab_f(t: f32) -> f32 {
