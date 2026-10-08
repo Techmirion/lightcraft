@@ -195,6 +195,18 @@ compilation: ~0.4 s once per process — the desktop app starts it on a backgrou
 (`lightcraft_gpu::warm_up`), so the first loupe render doesn't wait for it; other processes create
 the device on their first GPU render. `lightcraft_gpu::ready()` asks without blocking.
 
+## Raw development on the GPU
+Full-size raw loads (exports, 1:1, merges) develop on the GPU when there is one (`lightcraft_gpu::develop_raw`,
+`crates/gpu/src/rawdev.rs`, `wgsl/raw*.wgsl`): the normalised mosaic goes up once; AHD demosaicing (four
+kernels: directional greens, CIELab of both candidates, homogeneity, choice), highlight reconstruction (the
+chromaticity pyramid of `lightcraft_raw::highlight`) and the camera colour transform (white balance, matrix,
+baseline exposure, fitted hue/saturation table) run there, and the developed image comes back once. Files
+with stage-3 opcodes, a default crop or DNG profile tables demosaic on the GPU and finish on the CPU.
+`tests/rawdev.rs` compares each step with the CPU (highlights and colour within 4e-4; AHD mean 7e-6, with a
+homogeneity tie decided the other way at ~0.03 % of edge values). On an RTX 5090 a 24 MP NEF loads in 0.4 s
+instead of 1.2 s. FXC (DX12) rejects dynamic writes into vector components in WGSL: build such values with
+`select`.
+
 ## Opening a photo (M5.4)
 - The loupe shows a stand-in at once (`media::QuickJob`): the photo's cached view render for its
   current settings, else (raws with their import look) the embedded camera JPEG, else a

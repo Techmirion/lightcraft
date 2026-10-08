@@ -139,7 +139,16 @@ const IDLE_TRIM: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Default for Renderer {
     fn default() -> Self {
-        let threads = if cfg!(target_arch = "wasm32") { 0 } else { JobPool::<Slot, RenderResult>::default_threads().min(6) };
+        // Render workers: up to 12 on big CPUs (a raw thumbnail without a cached render decodes the
+        // whole file, mostly one serial stream, so more photos at once fill the grid faster);
+        // `LIGHTCRAFT_RENDER_THREADS` overrides.
+        let threads = if cfg!(target_arch = "wasm32") {
+            0
+        } else if let Some(n) = std::env::var("LIGHTCRAFT_RENDER_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            n.clamp(1, 32)
+        } else {
+            std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2)).clamp(2, 12)
+        };
         Self::with_worker_threads(threads)
     }
 }
