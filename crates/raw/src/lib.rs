@@ -563,8 +563,17 @@ impl RawImage {
     /// Full "raw → camera RGB" path: normalise, demosaic with `method`, apply `OpcodeList3`, then the default crop.
     /// The result is camera RGB (not white balanced), white level = 1.0, not oriented.
     pub fn develop(&self, method: Method) -> Result<Rgb32f> {
+        self.develop_with(method, |_| None)
+    }
+
+    /// [`RawImage::develop`] with another demosaicer tried first (e.g. the GPU's): `alt` gets the
+    /// normalised data and returns the demosaiced image, or `None` to use [`demosaic`] with `method`.
+    pub fn develop_with(&self, method: Method, alt: impl FnOnce(&Normalized) -> Option<Rgb32f>) -> Result<Rgb32f> {
         let n = self.normalized()?;
-        let mut rgb = demosaic(&n, method);
+        let mut rgb = match alt(&n) {
+            Some(rgb) if rgb.width == n.width && rgb.height == n.height => rgb,
+            _ => demosaic(&n, method),
+        };
         drop(n);
         opcodes::apply_list3(&self.opcodes.list3, &mut rgb);
         let c = self.crop.clipped(rgb.width, rgb.height);

@@ -61,6 +61,20 @@ const MODULES: &[Module] = &[
         entries: &["shape", "combine", "finalize"],
     },
     Module {
+        src: include_str!("wgsl/raw.wgsl"),
+        bindings: &[
+            ("mos", false, "f32"),
+            ("gh", true, "f32"),
+            ("gv", true, "f32"),
+            ("lab_h", true, "f32"),
+            ("lab_v", true, "f32"),
+            ("hom", true, "u32"),
+            ("out", true, "f32"),
+        ],
+        entries: &["ahd_green", "ahd_lab", "ahd_hom", "ahd_out"],
+    },
+    Module { src: include_str!("wgsl/raw_colour.wgsl"), bindings: &[("table", false, "f32"), ("img", true, "f32")], entries: &["camera_colour"] },
+    Module {
         src: include_str!("wgsl/geom.wgsl"),
         bindings: &[("src", false, "f32"), ("dst", true, "f32"), ("coverage", false, "u32")],
         entries: &["orient", "sample_affine", "sample_warp"],
@@ -525,7 +539,8 @@ impl Gpu {
     /// nothing more is submitted.
     pub fn finish_and_read<T: bytemuck::Pod>(&self, mut enc: wgpu::CommandEncoder, src: &Buf, len: usize) -> Vec<T> {
         assert!(len <= src.len, "readback of {len} values from a buffer of {}", src.len);
-        let zeros = || vec![<T as bytemuck::Zeroable>::zeroed(); len];
+        // `len` counts 32-bit values; T may group several (e.g. [f32; 3] pixels)
+        let zeros = || vec![<T as bytemuck::Zeroable>::zeroed(); len * 4 / std::mem::size_of::<T>().max(1)];
         if failed() {
             return zeros();
         }
@@ -713,6 +728,19 @@ pub fn groups1(n: usize) -> [u32; 3] {
 
 #[cfg(test)]
 mod tests {
+    /// Every module parses and validates as WGSL without a device (a broken kernel would otherwise
+    /// only show at device creation, disabling the GPU altogether).
+    #[test]
+    fn modules_validate() {
+        let consts = super::constants();
+        for m in super::MODULES {
+            let src = super::module_source(m, &consts);
+            let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{:?}: {}", m.entries, e.emit_to_string(&src)));
+            let mut v = wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all());
+            v.validate(&module).unwrap_or_else(|e| panic!("{:?}: {}", m.entries, e.emit_to_string(&src)));
+        }
+    }
+
     #[test]
     fn limits_override_parses() {
         assert_eq!(super::parse_limits("webgpu"), Some((128 << 20, 256 << 20)));

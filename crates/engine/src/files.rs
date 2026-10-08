@@ -249,7 +249,14 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
             Some(img) => img,
             None => {
                 let method = if max_edge <= 600 { lightcraft_raw::Method::Bilinear } else { lightcraft_raw::Method::Ahd };
-                raw.develop(method).map_err(|e| e.to_string())?
+                // full-size AHD on the GPU when there is one (exports, 1:1); the CPU otherwise
+                let gpu = |n: &lightcraft_raw::Normalized| -> Option<Rgb32f> {
+                    let cfa = n.cfa.as_ref().filter(|c| c.width == 2 && c.height == 2 && n.cpp == 1)?;
+                    let pattern: [u8; 4] = cfa.pattern.as_slice().try_into().ok()?;
+                    let data = lightcraft_gpu::demosaic_ahd(n.width, n.height, &n.data, pattern)?;
+                    Some(Rgb32f { width: n.width, height: n.height, data })
+                };
+                if method == lightcraft_raw::Method::Ahd { raw.develop_with(method, gpu) } else { raw.develop(method) }.map_err(|e| e.to_string())?
             }
         };
         // the samples aren't needed any more (the colour model below reads only the tags)
@@ -264,22 +271,35 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
         let wb = t.wb;
         // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
         let tables = lightcraft_raw::profile::ProfileTables::new(&raw.color.profile, lightcraft_raw::color::illuminant_weight(&raw.color, xy));
-        img.map_in_place(|p| {
-            let c = [p[0] * wb[0], p[1] * wb[1], p[2] * wb[2]];
-            let rgb = [
-                m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2],
-                m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2],
-                m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
-            ];
-            let rgb = match &tables {
-                Some(tables) => tables.apply(rgb, gain),
-                None => rgb.map(|v| v * gain),
-            };
-            // after the baseline exposure, as when it was fitted
-            hue_sat.as_ref().map_or(rgb, |h| h.apply(rgb)).map(|v| v.max(0.0))
-        });
-        stages.push(("colour", t0.elapsed()));
-        let img = fit(&img, max_edge, max_edge, Filter::Box);
+        let on_gpu = tables.is_none() && {
+            let colour = lightcraft_gpu::CameraColour { wb, matrix: m, gain, hue_sat: hue_sat.as_ref().map(|h| h.gpu_table()) };
+            match lightcraft_gpu::camera_colour(&img.data, &colour) {
+                Some(data) if data.len() == img.data.len() => {
+                    img.data = data;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !on_gpu {
+            img.map_in_place(|p| {
+                let c = [p[0] * wb[0], p[1] * wb[1], p[2] * wb[2]];
+                let rgb = [
+                    m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2],
+                    m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2],
+                    m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
+                ];
+                let rgb = match &tables {
+                    Some(tables) => tables.apply(rgb, gain),
+                    None => rgb.map(|v| v * gain),
+                };
+                // after the baseline exposure, as when it was fitted
+                hue_sat.as_ref().map_or(rgb, |h| h.apply(rgb)).map(|v| v.max(0.0))
+            });
+        }
+        stages.push((if on_gpu { "colour (gpu)" } else { "colour" }, t0.elapsed()));
+        // no copy when the image already fits (full-size loads)
+        let img = if img.width.max(img.height) > max_edge { fit(&img, max_edge, max_edge, Filter::Box) } else { img };
         stages.push(("fit", t0.elapsed()));
         let img = img.into_oriented(raw.orientation);
         stages.push(("orient", t0.elapsed()));
@@ -561,5 +581,45 @@ mod tests {
         assert!(s.quick_thumb_job(&job).is_none());
         assert_eq!(s.quick_view_job(id, 1600, true).unwrap().run().quick, Some(QuickSource::Small));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod gpu_raw_tests {
+    /// `LC_SAMPLE_NEF=/path/to/file cargo test --release -p lightcraft-engine --lib gpu_raw_load -- --nocapture`:
+    /// a full-size raw load with the GPU (demosaic + colour) against the CPU, timed.
+    #[test]
+    fn gpu_raw_load_matches_cpu() {
+        let Some(path) = std::env::var_os("LC_SAMPLE_NEF") else { return };
+        if !lightcraft_gpu::available() {
+            eprintln!("skipped: no GPU");
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let _warm = super::load_bytes(&bytes, usize::MAX).unwrap();
+        let t = std::time::Instant::now();
+        let (gpu, _) = super::load_bytes(&bytes, usize::MAX).unwrap();
+        let t_gpu = t.elapsed();
+        lightcraft_gpu::set_enabled(false);
+        let t = std::time::Instant::now();
+        let (cpu, _) = super::load_bytes(&bytes, usize::MAX).unwrap();
+        let t_cpu = t.elapsed();
+        lightcraft_gpu::set_enabled(true);
+        assert_eq!((gpu.width, gpu.height), (cpu.width, cpu.height));
+        let (mut sum, mut max, mut big) = (0f64, 0f32, 0usize);
+        for (p, q) in gpu.data.iter().zip(&cpu.data) {
+            for c in 0..3 {
+                let d = (p[c] - q[c]).abs();
+                sum += f64::from(d);
+                max = max.max(d);
+                if d > 2e-3 {
+                    big += 1;
+                }
+            }
+        }
+        let n = 3 * gpu.data.len();
+        let mean = sum / n as f64;
+        println!("full-size load: gpu {t_gpu:?}, cpu {t_cpu:?}; mean |Δ| {mean:.2e}, max {max:.2e}, {big} of {n} values > 2e-3");
+        assert!(mean < 1e-4 && (big as f64) < 1e-4 * n as f64);
     }
 }

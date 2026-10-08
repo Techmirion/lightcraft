@@ -32,6 +32,8 @@ mod ctx;
 #[cfg(not(target_arch = "wasm32"))]
 mod params;
 #[cfg(not(target_arch = "wasm32"))]
+mod rawdev;
+#[cfg(not(target_arch = "wasm32"))]
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -360,5 +362,122 @@ pub fn render(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &R
     {
         let _ = (src, info, s, req, stages);
         None
+    }
+}
+
+/// The camera colour step of raw development (`lightcraft_engine::files`): white balance, camera
+/// matrix, baseline-exposure gain, then an optional fitted hue/saturation table.
+pub struct CameraColour<'a> {
+    pub wb: [f32; 3],
+    pub matrix: [[f32; 3]; 3],
+    pub gain: f32,
+    pub hue_sat: Option<HueSatTable<'a>>,
+}
+
+/// A hue/saturation/value table (`lightcraft_raw::profile::HsvTable`) applied in linear ProPhoto RGB
+/// to linear Rec.2020 pixels, luminance restored (`camera_preview::HueSat`).
+pub struct HueSatTable<'a> {
+    pub to_prophoto: [[f32; 3]; 3],
+    pub from_prophoto: [[f32; 3]; 3],
+    pub hue_divisions: usize,
+    pub sat_divisions: usize,
+    pub val_divisions: usize,
+    pub srgb_value: bool,
+    /// `(hue shift, saturation scale, value scale)` per entry, flattened.
+    pub data: &'a [f32],
+}
+
+/// Smallest image raw development is moved to the GPU for (smaller ones are quicker on the CPU).
+pub const RAW_MIN_PIXELS: usize = 4 << 20;
+
+/// AHD-demosaic a full-size normalised Bayer mosaic on the GPU (`cfa`: the 2 × 2 tile's colours,
+/// row-major). Interleaved RGB, or `None` (GPU unavailable, too small, over the device limits or a
+/// device failure; the caller demosaics on the CPU).
+pub fn demosaic_ahd(w: usize, h: usize, mosaic: &[f32], cfa: [u8; 4]) -> Option<Vec<[f32; 3]>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = w.checked_mul(h)?;
+        if n < RAW_MIN_PIXELS || mosaic.len() != n || cfa.iter().any(|&c| c > 2) || w > i32::MAX as usize / 4 || h > i32::MAX as usize / 4 {
+            return None;
+        }
+        guarded(&format!("demosaic {w}×{h}"), 3 * n, |g| rawdev::ahd(g, w, h, mosaic, cfa))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (w, h, mosaic, cfa);
+        None
+    }
+}
+
+/// [`CameraColour`] applied on the GPU to interleaved RGB; `None` as for [`demosaic_ahd`].
+pub fn camera_colour(rgb: &[[f32; 3]], c: &CameraColour<'_>) -> Option<Vec<[f32; 3]>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = rgb.len();
+        if n < RAW_MIN_PIXELS {
+            return None;
+        }
+        if let Some(t) = &c.hue_sat {
+            let entries = t.hue_divisions.checked_mul(t.sat_divisions)?.checked_mul(t.val_divisions)?;
+            if t.hue_divisions == 0 || t.sat_divisions < 2 || t.val_divisions == 0 || t.data.len() != 3 * entries {
+                return None;
+            }
+        }
+        guarded(&format!("camera colour {n} px"), 3 * n, |g| rawdev::colour(g, rgb, c))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (rgb, c);
+        None
+    }
+}
+
+/// Run raw-development GPU work with the render's safety net: error scopes, panic guard, limit and
+/// failure handling ([`render`]); `largest` = the largest buffer (32-bit values) it needs.
+#[cfg(not(target_arch = "wasm32"))]
+fn guarded<T>(what: &str, largest: usize, f: impl FnOnce(&ctx::Gpu) -> T) -> Option<T> {
+    if !enabled() {
+        return None;
+    }
+    let gpu = device()?;
+    if !gpu.fits(largest) {
+        record_fallback(format!("{what}: over the device's buffer limit"));
+        return None;
+    }
+    let _ = ctx::take_failure();
+    let (r, scoped) = {
+        let _scope = ctx::RenderScope::new(gpu);
+        let errors = ctx::ErrorScopes::push(gpu);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(gpu)));
+        (r, errors.pop())
+    };
+    let failure = match (ctx::take_failure(), scoped) {
+        (Some(f), _) if f.kind == ctx::FailKind::Limit => Some(f),
+        (f, scoped) => scoped.or(f),
+    };
+    match (r, failure) {
+        (Err(_), _) => {
+            mark_broken("GPU raw development panicked");
+            record_fallback(format!("{what}: panicked; the GPU is not used again"));
+            None
+        }
+        (Ok(_), Some(f)) => {
+            let reason = match f.kind {
+                ctx::FailKind::Fatal => {
+                    mark_broken(&f.reason);
+                    format!("{what}: {}; the GPU is not used again", f.reason)
+                }
+                ctx::FailKind::OutOfMemory => {
+                    gpu.trim(0);
+                    format!("{what}: {}", f.reason)
+                }
+                ctx::FailKind::Limit | ctx::FailKind::Blank => format!("{what}: {}", f.reason),
+            };
+            log::warn!("gpu: raw development on the CPU instead: {reason}");
+            record_fallback(reason);
+            None
+        }
+        (Ok(_), None) if BROKEN.load(Ordering::Relaxed) => None,
+        (Ok(v), None) => Some(v),
     }
 }

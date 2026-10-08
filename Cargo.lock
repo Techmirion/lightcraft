@@ -2929,6 +2929,7 @@ dependencies = [
  "lightcraft-geom",
  "lightcraft-pipeline",
  "lightcraft-raster",
+ "lightcraft-raw",
  "lightcraft-scenes",
  "log",
  "pollster 1.0.1",

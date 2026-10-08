@@ -300,6 +300,19 @@ impl<'a> HueSat<'a> {
         Some(HueSat { table, to: to.to_f32(), from: to.inverse()?.to_f32() })
     }
 
+    /// The table as the GPU colour kernel takes it (`lightcraft_gpu::camera_colour`).
+    pub fn gpu_table(&self) -> lightcraft_gpu::HueSatTable<'a> {
+        lightcraft_gpu::HueSatTable {
+            to_prophoto: self.to,
+            from_prophoto: self.from,
+            hue_divisions: self.table.hue_divisions,
+            sat_divisions: self.table.sat_divisions,
+            val_divisions: self.table.val_divisions,
+            srgb_value: self.table.srgb_value,
+            data: self.table.data.as_flattened(),
+        }
+    }
+
     #[inline]
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
         let mul = |m: &[[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]) };
