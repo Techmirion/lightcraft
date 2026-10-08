@@ -57,6 +57,11 @@ The timings below were measured on an RTX 5090 / Windows 11 machine with Nikon D
   (default: half the cores, 2–8).
 - Background render workers grow with the CPU (up to 12). `LIGHTCRAFT_RENDER_THREADS` overrides the
   number.
+- Previews keep their detail. A render that goes through a crop, a rotation or a lens correction is
+  resampled at twice the size on screen and then reduced with a Catmull-Rom filter (CPU and GPU alike),
+  instead of being resampled bilinearly at screen size. On D3500 photos, a loupe preview went from
+  about half to about 80 % of the fine detail of a full-size render reduced to the same size, and grid
+  thumbnails went to 93–100 %. Grid tiles also reuse the larger thumbnails that Build Previews makes.
 
 ## Building
 
