@@ -83,6 +83,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
     let mut metadata = lightcraft_meta::from_tiff(&tiff);
     metadata.width = Some(active_w as u32);
     metadata.height = Some(h as u32);
+    if let Some(m) = mn.as_ref() {
+        fill_lens(&mut metadata, &m.ifd);
+    }
     let img = RawImage {
         format: RawFormat::Nef,
         width: w,
@@ -104,6 +107,51 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RawImage> {
     };
     img.validate()?;
     Ok(img)
+}
+
+/// Nikon DSLRs (D3500, D5x00, D7x00 …) write no Exif `LensModel`/`LensSpecification`. The maker note's `0x0084`
+/// Lens (min/max focal length, f-number at each) and `0x0083` LensType flags (ExifTool tag-name documentation:
+/// 1 MF, 2 D, 4 G, 8 VR, 64 E, 128 AF-P) are not encrypted: fill the lens spec and a readable lens name from them
+/// when the Exif tags are missing.
+pub(crate) fn fill_lens(metadata: &mut lightcraft_meta::Metadata, mn: &Ifd) {
+    const LENS_TYPE: u16 = 0x0083;
+    const LENS: u16 = 0x0084;
+    let Some(spec) = mn.f64s(LENS) else { return };
+    let [f0, f1, a0, a1] = match spec.as_slice() {
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => return,
+    };
+    let sane = |v: f64, hi: f64| v.is_finite() && v > 0.0 && v < hi;
+    if !(sane(f0, 5000.0) && sane(f1, 5000.0) && sane(a0, 100.0) && sane(a1, 100.0)) || f1 < f0 {
+        return;
+    }
+    if metadata.lens_spec.is_none() {
+        metadata.lens_spec = Some([f0, f1, a0, a1]);
+    }
+    if metadata.lens_model.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        let flags = mn.bytes(LENS_TYPE).and_then(|b| b.first().copied()).unwrap_or(0);
+        let num = |v: f64| {
+            let s = format!("{:.1}", v);
+            s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+        };
+        let focal = if (f1 - f0).abs() < 0.5 { format!("{}mm", num(f0)) } else { format!("{}-{}mm", num(f0), num(f1)) };
+        let aperture = if (a1 - a0).abs() < 0.05 { format!("f/{}", num(a0)) } else { format!("f/{}-{}", num(a0), num(a1)) };
+        let kind = if flags & 64 != 0 {
+            "E"
+        } else if flags & 4 != 0 {
+            "G"
+        } else if flags & 2 != 0 {
+            "D"
+        } else {
+            ""
+        };
+        let afp = if flags & 128 != 0 { "AF-P " } else { "" };
+        let vr = if flags & 8 != 0 { " VR" } else { "" };
+        metadata.lens_model = Some(format!("Nikon {afp}{focal} {aperture}{kind}{vr}"));
+        if metadata.lens_make.is_none() {
+            metadata.lens_make = Some("Nikon".into());
+        }
+    }
 }
 
 /// Uncompressed strips: 16-bit words or 12-bit MSB-packed, told apart by the strip size.

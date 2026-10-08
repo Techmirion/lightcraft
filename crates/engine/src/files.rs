@@ -82,7 +82,8 @@ pub fn embedded_lens(raw: &lightcraft_raw::RawInfo) -> Option<lightcraft_develop
         }
     }
     if lens.warp.is_none() && lens.vignette.is_none() {
-        return None;
+        // no corrections in the file: a lens profile of our own for this lens, if one matches
+        return crate::lens_profiles::for_raw(raw, cw, ch);
     }
     Some(lightcraft_pipeline::optics::reorient_lens(&lens, raw.orientation, cw, ch))
 }
@@ -100,7 +101,7 @@ fn ext_upper(name: &str) -> String {
 pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
     let content_hash = Some(lightcraft_preview::hash_bytes(bytes).to_string());
     let m = lightcraft_meta::extract(bytes);
-    let (meta, captured) = meta_of(&m);
+    let (mut meta, captured) = meta_of(&m);
     if lightcraft_raw::probe(bytes).is_some() {
         let raw = match lightcraft_raw::probe_info(bytes) {
             Ok(r) => r,
@@ -136,6 +137,12 @@ pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
         let relative = crate::camera_preview::file_local_look(raw.format) && !lightcraft_raw::color::has_matrix(&raw.color);
         let as_shot_wb = Some(if relative { (6500.0, 0.0) } else { (t.round(), tint.round()) });
         let embedded_lens = embedded_lens(&raw);
+        if meta.lens.is_empty()
+            && let Some(lens) = raw.metadata.lens_model.as_ref()
+        {
+            // vendor maker-note lens name (e.g. Nikon DSLRs without Exif LensModel)
+            meta.lens = lens.clone();
+        }
         return Ok(ProbeInfo {
             embedded_lens,
             width: w,

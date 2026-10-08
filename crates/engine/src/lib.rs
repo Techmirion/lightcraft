@@ -24,6 +24,7 @@ pub mod fonts;
 pub mod guard;
 pub mod import;
 mod import_move;
+pub mod lens_profiles;
 pub mod library;
 pub mod media;
 pub mod memory;
