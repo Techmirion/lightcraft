@@ -73,6 +73,11 @@ const MODULES: &[Module] = &[
         ],
         entries: &["ahd_green", "ahd_lab", "ahd_hom", "ahd_out"],
     },
+    Module {
+        src: include_str!("wgsl/raw_hl.wgsl"),
+        bindings: &[("img", true, "f32"), ("pyr", true, "f32")],
+        entries: &["hl_first", "hl_down", "hl_fill", "hl_apply"],
+    },
     Module { src: include_str!("wgsl/raw_colour.wgsl"), bindings: &[("table", false, "f32"), ("img", true, "f32")], entries: &["camera_colour"] },
     Module {
         src: include_str!("wgsl/geom.wgsl"),

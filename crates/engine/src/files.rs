@@ -245,42 +245,61 @@ fn load_bytes_now(bytes: std::borrow::Cow<'_, [u8]>, max_edge: usize) -> Result<
             Some(k) => raw.develop_binned(k, HIGHLIGHT_CLIP).map_err(|e| e.to_string())?,
             None => None,
         };
-        let mut img = match binned {
-            Some(img) => img,
-            None => {
-                let method = if max_edge <= 600 { lightcraft_raw::Method::Bilinear } else { lightcraft_raw::Method::Ahd };
-                // full-size AHD on the GPU when there is one (exports, 1:1); the CPU otherwise
-                let gpu = |n: &lightcraft_raw::Normalized| -> Option<Rgb32f> {
-                    let cfa = n.cfa.as_ref().filter(|c| c.width == 2 && c.height == 2 && n.cpp == 1)?;
-                    let pattern: [u8; 4] = cfa.pattern.as_slice().try_into().ok()?;
-                    let data = lightcraft_gpu::demosaic_ahd(n.width, n.height, &n.data, pattern)?;
-                    Some(Rgb32f { width: n.width, height: n.height, data })
-                };
-                if method == lightcraft_raw::Method::Ahd { raw.develop_with(method, gpu) } else { raw.develop(method) }.map_err(|e| e.to_string())?
-            }
-        };
-        // the samples aren't needed any more (the colour model below reads only the tags)
-        raw.data = lightcraft_raw::RawData::U16(Vec::new());
-        let mut stages = vec![("develop", t0.elapsed())];
-        stages.push(("transform", t0.elapsed()));
-        lightcraft_raw::highlight::reconstruct(&mut img, t.wb, HIGHLIGHT_CLIP);
-        stages.push(("highlights", t0.elapsed()));
+        // the colour model (read from the tags; computed up front so the GPU can apply it in the same pass)
         let m = camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix).to_f32();
         let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
         let gain = 2f32.powf(t.baseline_exposure as f32);
         let wb = t.wb;
         // A DNG's own profile look (hue/saturation map, look table), DNG spec chapter 6.
         let tables = lightcraft_raw::profile::ProfileTables::new(&raw.color.profile, lightcraft_raw::color::illuminant_weight(&raw.color, xy));
-        let on_gpu = tables.is_none() && {
-            let colour = lightcraft_gpu::CameraColour { wb, matrix: m, gain, hue_sat: hue_sat.as_ref().map(|h| h.gpu_table()) };
-            match lightcraft_gpu::camera_colour(&img.data, &colour) {
-                Some(data) if data.len() == img.data.len() => {
-                    img.data = data;
-                    true
-                }
-                _ => false,
+        let colour = lightcraft_gpu::CameraColour { wb, matrix: m, gain, hue_sat: hue_sat.as_ref().map(|h| h.gpu_table()) };
+        // Full-size AHD (exports, 1:1) on the GPU when there is one: in one pass (demosaic, highlights,
+        // colour) when nothing sits between those steps (no stage-3 opcodes, no default crop, no DNG
+        // profile tables), else the demosaic alone. `fused` records which happened.
+        let fused = std::cell::Cell::new(false);
+        let mut img = match binned {
+            Some(img) => img,
+            None => {
+                let method = if max_edge <= 600 { lightcraft_raw::Method::Bilinear } else { lightcraft_raw::Method::Ahd };
+                let one_pass = tables.is_none() && raw.opcodes.list3.is_empty();
+                let crop = raw.crop;
+                let gpu = |n: &lightcraft_raw::Normalized| -> Option<Rgb32f> {
+                    let cfa = n.cfa.as_ref().filter(|c| c.width == 2 && c.height == 2 && n.cpp == 1)?;
+                    let pattern: [u8; 4] = cfa.pattern.as_slice().try_into().ok()?;
+                    let c = crop.clipped(n.width, n.height);
+                    let uncropped = c.width == 0 || c.height == 0 || (c.x == 0 && c.y == 0 && c.width == n.width && c.height == n.height);
+                    if one_pass && uncropped {
+                        let hl = Some((wb, HIGHLIGHT_CLIP));
+                        if let Some(data) = lightcraft_gpu::develop_raw(n.width, n.height, &n.data, pattern, hl, &colour) {
+                            fused.set(true);
+                            return Some(Rgb32f { width: n.width, height: n.height, data });
+                        }
+                    }
+                    let data = lightcraft_gpu::demosaic_ahd(n.width, n.height, &n.data, pattern)?;
+                    Some(Rgb32f { width: n.width, height: n.height, data })
+                };
+                if method == lightcraft_raw::Method::Ahd { raw.develop_with(method, gpu) } else { raw.develop(method) }.map_err(|e| e.to_string())?
             }
         };
+        let fused = fused.get();
+        // the samples aren't needed any more (the colour model below reads only the tags)
+        raw.data = lightcraft_raw::RawData::U16(Vec::new());
+        let mut stages = vec![(if fused { "develop (gpu: demosaic, highlights, colour)" } else { "develop" }, t0.elapsed())];
+        stages.push(("transform", t0.elapsed()));
+        if !fused {
+            lightcraft_raw::highlight::reconstruct(&mut img, t.wb, HIGHLIGHT_CLIP);
+        }
+        stages.push(("highlights", t0.elapsed()));
+        let on_gpu = fused
+            || tables.is_none() && {
+                match lightcraft_gpu::camera_colour(&img.data, &colour) {
+                    Some(data) if data.len() == img.data.len() => {
+                        img.data = data;
+                        true
+                    }
+                    _ => false,
+                }
+            };
         if !on_gpu {
             img.map_in_place(|p| {
                 let c = [p[0] * wb[0], p[1] * wb[1], p[2] * wb[2]];
@@ -619,7 +638,7 @@ mod gpu_raw_tests {
         }
         let n = 3 * gpu.data.len();
         let mean = sum / n as f64;
-        println!("full-size load: gpu {t_gpu:?}, cpu {t_cpu:?}; mean |Δ| {mean:.2e}, max {max:.2e}, {big} of {n} values > 2e-3");
+        println!("full-size load: gpu {t_gpu:?}, cpu {t_cpu:?}; mean |d| {mean:.2e}, max {max:.2e}, {big} of {n} values > 2e-3");
         assert!(mean < 1e-4 && (big as f64) < 1e-4 * n as f64);
     }
 }

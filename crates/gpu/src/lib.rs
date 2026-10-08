@@ -417,11 +417,8 @@ pub fn camera_colour(rgb: &[[f32; 3]], c: &CameraColour<'_>) -> Option<Vec<[f32;
         if n < RAW_MIN_PIXELS {
             return None;
         }
-        if let Some(t) = &c.hue_sat {
-            let entries = t.hue_divisions.checked_mul(t.sat_divisions)?.checked_mul(t.val_divisions)?;
-            if t.hue_divisions == 0 || t.sat_divisions < 2 || t.val_divisions == 0 || t.data.len() != 3 * entries {
-                return None;
-            }
+        if !table_ok(c) {
+            return None;
         }
         guarded(&format!("camera colour {n} px"), 3 * n, |g| rawdev::colour(g, rgb, c))
     }
@@ -429,6 +426,65 @@ pub fn camera_colour(rgb: &[[f32; 3]], c: &CameraColour<'_>) -> Option<Vec<[f32;
     {
         let _ = (rgb, c);
         None
+    }
+}
+
+/// Full-size raw development on the GPU in one pass: AHD demosaic of the normalised Bayer mosaic,
+/// then (with `highlights = Some((wb, clip))`) highlight reconstruction, then [`CameraColour`].
+/// One upload and one readback; `None` as for [`demosaic_ahd`].
+pub fn develop_raw(
+    w: usize,
+    h: usize,
+    mosaic: &[f32],
+    cfa: [u8; 4],
+    highlights: Option<([f32; 3], f32)>,
+    colour: &CameraColour<'_>,
+) -> Option<Vec<[f32; 3]>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = w.checked_mul(h)?;
+        if n < RAW_MIN_PIXELS || mosaic.len() != n || cfa.iter().any(|&c| c > 2) || w > i32::MAX as usize / 4 || h > i32::MAX as usize / 4 {
+            return None;
+        }
+        if highlights.is_some_and(|(wb, clip)| !(wb.iter().all(|v| v.is_finite() && *v > 0.0) && clip.is_finite() && clip > 0.0)) {
+            return None;
+        }
+        if !table_ok(colour) {
+            return None;
+        }
+        guarded(&format!("raw development {w}×{h}"), 3 * n, |g| rawdev::develop(g, w, h, mosaic, cfa, highlights, colour))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (w, h, mosaic, cfa, highlights, colour);
+        None
+    }
+}
+
+/// Highlight reconstruction alone on the GPU (equivalence tests; `w × h` camera RGB).
+#[doc(hidden)]
+pub fn reconstruct_highlights(rgb: &[[f32; 3]], w: usize, h: usize, wb: [f32; 3], clip: f32) -> Option<Vec<[f32; 3]>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if rgb.len() != w.checked_mul(h)? || rgb.is_empty() {
+            return None;
+        }
+        guarded("highlights", 3 * rgb.len(), |g| rawdev::highlights_only(g, rgb, w, h, wb, clip))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (rgb, w, h, wb, clip);
+        None
+    }
+}
+
+fn table_ok(c: &CameraColour<'_>) -> bool {
+    match &c.hue_sat {
+        None => true,
+        Some(t) => {
+            let entries = t.hue_divisions.checked_mul(t.sat_divisions).and_then(|v| v.checked_mul(t.val_divisions));
+            t.hue_divisions > 0 && t.sat_divisions >= 2 && t.val_divisions > 0 && entries.is_some_and(|e| t.data.len() == 3 * e)
+        }
     }
 }
 

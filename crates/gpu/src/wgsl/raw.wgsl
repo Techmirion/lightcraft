@@ -119,7 +119,10 @@ fn candidate(v: bool, x: i32, y: i32) -> vec3<f32> {
 
 fn lab_f(t: f32) -> f32 {
     if (t > 0.008856) {
-        return cbrt(t);
+        // pow(t, 1/3) refined by one Newton step: closer to the CPU's correctly rounded cbrt, so
+        // fewer homogeneity ties are decided differently
+        let y = pow(t, 1.0 / 3.0);
+        return y - (y * y * y - t) / (3.0 * y * y);
     }
     return 7.787 * t + 16.0 / 116.0;
 }
